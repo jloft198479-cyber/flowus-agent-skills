@@ -36,11 +36,27 @@ process.stderr.setDefaultEncoding('utf-8');
 const fs = require('fs');
 const path = require('path');
 const rest = require('./lib/rest-client');
-const mcp = require('./lib/mcp-client');  // putMarkdown 模式需要 MCP
+// MCP 不再需要：FlowUs MCP Server 不提供 API-putMarkdown 工具，写入统一用 REST 块模式
 
 // ============== 配置 ==============
-/** Token 必须通过环境变量 FLOWUS_TOKEN 提供 */
-const TOKEN = process.env.FLOWUS_TOKEN;
+/**
+ * Token 解析优先级（从高到低）：
+ *   1. --token <xxx> 命令行参数（Agent 显式传入）
+ *   2. FLOWUS_TOKEN 环境变量（手动终端测试）
+ *   3. 当前工作目录下 .env 文件（Agent 首次授权后缓存）
+ */
+function _resolveToken(cliToken) {
+  if (cliToken) return cliToken;
+  if (process.env.FLOWUS_TOKEN) return process.env.FLOWUS_TOKEN;
+  // 从工作目录的 .env 读取（Agent workspace 下缓存）
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    const content = fs.readFileSync(envPath, 'utf8');
+    const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
+    if (m) return m[1].trim();
+  } catch (_) { /* .env 不存在则忽略 */ }
+  return null;
+}
 /** 默认父级数据库（可通过环境变量 FLOWUS_DEFAULT_PARENT 覆盖，或通过 --parent 指定） */
 const DEFAULT_PARENT_DB = process.env.FLOWUS_DEFAULT_PARENT || '';
 
@@ -51,6 +67,65 @@ function log(msg) {
 function out(msg) {
   console.log(msg);
 }
+
+// ============== 帮助信息 ==============
+const HELP_TEXT = `
+FlowUs 写入脚本 v4.0（纯 REST 块模式 + 块编辑 + 文件上传 + 数据库管理）
+
+写入模式:
+  统一使用 REST 块模式（mdToBlocks + appendBlocks），不依赖 MCP
+
+块级编辑:
+  --edit-block <blockId> --text "新内容"    更新块内容（段落/标题/代码等）
+  --edit-block <blockId> --checked true     更新待办块的勾选状态
+  --delete-block <blockId> --force          删除单个块
+
+文件上传:
+  --upload <本地文件路径> --parent <pageId>  上传文件到页面（图片自动插入 image 块）
+
+数据库管理:
+  --create-db <pageId> --title "数据库名" --db-props '{"名称":{"type":"title"},"状态":{"type":"select"}}'
+  --update-db <dbId> --db-props '{"新字段":{"type":"rich_text"}}'  添加数据库属性
+  --delete-db <dbId> --force               删除数据库
+
+属性管理:
+  --update-prop <pageId> --set-title "标题"    更新页面标题
+  --update-prop <pageId> --set-select "状态:已完成"  更新 select 字段
+  --update-prop <pageId> --set-checkbox "完成:true"  更新复选框
+  --update-prop <pageId> --set-text "描述:内容"    更新富文本字段
+  --update-prop <pageId> --set-icon "📝" --set-cover "url"  更新图标封面
+
+删除:
+  --delete <pageId/blockId> --force  删除页面或块（软删除，移入回收站可恢复）
+
+用法:
+  node flowus-write.js <文件.md> [标题]           上传文件
+  node flowus-write.js --db <id> <文件> [标题]     指定目标数据库（--db 是 --parent 的别名）
+  node flowus-write.js --db <id> --title "标题" --text "正文"  直接文本写入
+  node flowus-write.js --parent-type page <文件>  父级为普通页面
+  node flowus-write.js --update <文件> [标题]     更新已有页面
+  node flowus-write.js --dry-run <文件>           只解析不写入
+
+参数:
+  --db <id>           目标数据库 ID（--parent 的别名）
+  --title <标题>       页面标题
+  --text <内容>        页面正文内容
+  --icon <emoji>      页面图标
+  --cover <url>       页面封面
+  --token <授权码>     FlowUs 授权 token
+  --help              显示此帮助信息
+
+支持的 Markdown 格式:
+  # ## ### 标题    **粗体** *斜体* \`代码\`
+  \`\`\`代码块\`\`\`   > 引用   >! 标注   --- 分隔线
+  - 无序列表   1. 有序列表   - [x] 待办   | 表格
+  ![图片](url)  [书签](url)
+
+Token:
+  --token <授权码>  传入 token（优先级最高）
+  FLOWUS_TOKEN      环境变量
+  .env 文件         当前目录下 FLOWUS_TOKEN=xxx
+`;
 
 // ============== 参数解析 ==============
 function parseArgs(argv) {
@@ -76,14 +151,32 @@ function parseArgs(argv) {
     // 删除模式（--delete）
     deleteId: null,
     force: false,       // --force
+    // 块级编辑（--edit-block / --delete-block）
+    editBlockId: null,  // --edit-block <blockId>
+    deleteBlockId: null, // --delete-block <blockId>
+    editBlockText: null, // --text 配合 --edit-block 使用
+    editChecked: null,   // --checked true/false 配合 --edit-block 使用
+    // 文件上传（--upload）
+    uploadFilePath: null, // --upload <本地文件路径>
+    // 数据库管理（--create-db / --update-db / --delete-db）
+    createDbParentId: null, // --create-db <pageId>
+    updateDbId: null,       // --update-db <dbId>
+    deleteDbId: null,       // --delete-db <dbId>
+    dbProps: null,          // --db-props <JSON>
+    token: null,        // --token <授权码>
+    help: false,        // --help
   };
 
   let positional = [];
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--parent') {
+    if (a === '--help' || a === '-h') {
+      opts.help = true;
+    } else if (a === '--parent' || a === '--db') {
       opts.parentDbId = argv[++i];
+    } else if (a === '--token') {
+      opts.token = argv[++i] || '';
     } else if (a === '--parent-type') {
       opts.parentType = argv[++i];
     } else if (a === '--update') {
@@ -92,8 +185,17 @@ function parseArgs(argv) {
       opts.dryRun = true;
     } else if (a === '--blocks') {
       opts.blocksMode = true;
+    } else if (a === '--text') {
+      // PowerShell 中 \n 不会解释为换行符，需要手动转换
+      const textVal = (argv[++i] || '').replace(/\\n/g, '\n');
+      // --edit-block 模式下 --text 表示块内容更新
+      if (opts.editBlockId) {
+        opts.editBlockText = textVal;
+      } else {
+        opts.textContent = textVal;
+      }
     } else if (a === '--title') {
-      opts.textContent = argv[++i] || '';
+      opts.title = argv[++i] || '';
     } else if (a === '--raw') {
       opts.rawBlocks = argv[++i] || '';
     } else if (a === '--raw-file') {
@@ -120,6 +222,22 @@ function parseArgs(argv) {
       opts.deleteId = argv[++i] || '';
     } else if (a === '--force') {
       opts.force = true;
+    } else if (a === '--edit-block') {
+      opts.editBlockId = argv[++i] || '';
+    } else if (a === '--delete-block') {
+      opts.deleteBlockId = argv[++i] || '';
+    } else if (a === '--checked') {
+      opts.editChecked = argv[++i] || '';
+    } else if (a === '--upload') {
+      opts.uploadFilePath = argv[++i] || '';
+    } else if (a === '--create-db') {
+      opts.createDbParentId = argv[++i] || '';
+    } else if (a === '--update-db') {
+      opts.updateDbId = argv[++i] || '';
+    } else if (a === '--delete-db') {
+      opts.deleteDbId = argv[++i] || '';
+    } else if (a === '--db-props') {
+      opts.dbProps = argv[++i] || '';
     } else if (!a.startsWith('--')) {
       positional.push(a);
     }
@@ -154,7 +272,7 @@ const LANGUAGE_MAP = {
   'plaintext': 'Plain Text', 'plain': 'Plain Text', 'plain text': 'Plain Text', 'text': 'Plain Text',
   'dart': 'Dart', 'lua': 'Lua', 'perl': 'Perl',
   'powershell': 'PowerShell', 'vb': 'VB.NET',
-  'objective-c': 'Objective-C', 'swift': 'Swift',
+  'objective-c': 'Objective-C',
   'dockerfile': 'Dockerfile', 'makefile': 'MakeFile',
   'mermaid': 'Mermaid', 'latex': 'LaTeX', 'tex': 'LaTeX',
   'diff': 'diff', 'nginx': 'Nginx',
@@ -170,7 +288,7 @@ const CODE_EXTS = new Set([
   '.dockerfile', '.makefile', '.cmake', '.proto', '.graphql', '.gql',
   '.vue', '.svelte', '.ex', '.exs', '.erl', '.hs', '.ml', '.mli',
   '.clj', '.cljs', '.coffee', '.lisp', '.el', '.vim', '.tf', '.hcl',
-  '.toml', 'ini', '.cfg', '.conf', '.env', '.gitignore',
+  '.toml', '.ini', '.cfg', '.conf', '.env', '.gitignore',
 ]);
 
 /** 合法的颜色值 */
@@ -194,17 +312,17 @@ const DEFAULT_ANNOTATIONS = Object.freeze({
  * @returns {object}
  */
 function rt(content, annotations) {
-  const anno = annotations ? { ...DEFAULT_ANNOTATIONS, ...annotations } : { ...DEFAULT_ANNOTATIONS };
-  // 校验颜色值
+  // 创建时必须含 type: 'text'，否则 FlowUs API 会静默丢弃 content
+  if (!annotations) {
+    return { type: 'text', text: { content } };
+  }
+  // 显式需要格式化时附加 annotations
+  const anno = { ...DEFAULT_ANNOTATIONS, ...annotations };
   if (!VALID_COLORS.has(anno.color)) anno.color = 'default';
-  // 提取链接（用于 href 字段）
-  const link = null; // 行内解析中单独处理链接时覆盖此值
   return {
     type: 'text',
-    text: { content, link },
+    text: { content, link: null },
     annotations: anno,
-    plain_text: content,   // 官方文档必填：纯文本副本
-    href: null,            // 官方文档必填：链接（null 表示无链接）
   };
 }
 
@@ -228,16 +346,17 @@ function splitRichText(content, annotations) {
 /**
  * 创建 FlowUs REST API 写入格式的 block 对象
  *
- * 重要：FlowUs REST API 的写入格式使用 { type, data: {... } }
- *   （读取返回时服务端会转换为 { type, [typename]:{...} } 格式）
- *   这是经过实测验证的写入格式，官方文档展示的是读取格式
+ * 重要：FlowUs REST API 的写入格式使用 { object: "block", type, [typeName]: {...} }
+ *   读取返回时服务端使用 { type, data: {...} } 格式
+ *   写入时必须用类型名键（如 paragraph、heading_1），不能用 data 键
+ *   使用 data 键时 API 不会报错，但会静默丢弃 rich_text 中的文本内容
  *
  * @param {string} type - 块类型（如 'paragraph', 'heading_1', 'code'）
  * @param {object} data - 块数据
- * @returns {object} { type, data }
+ * @returns {object} { object: "block", type, [typeName]: data }
  */
 function block(type, data) {
-  return { type, data };
+  return { object: 'block', type, [type]: data };
 }
 
 /**
@@ -290,6 +409,106 @@ function parseInline(text) {
 // ============== Markdown → Block 解析器 ==============
 
 /**
+ * 预处理 Markdown：清洗 MDX/HTML 组件标签，保留纯 Markdown 内容
+ *
+ * 处理规则：
+ * - MDX 提示组件（<Warning>, <Tip>, <Note> 等）→ 转为 callout 格式（>! ⚠️ 内容）
+ * - 容器型 MDX 组件（<CardGroup>, <Card>, <Tabs>, <Tab> 等）→ 剥离标签，保留内部文本
+ * - HTML 注释 → 移除
+ * - 转义字符 \* \_ \# → 还原为 * _ #（代码块外）
+ * - 代码块内不做任何处理
+ */
+function preprocessMd(md) {
+  const lines = md.split(/\r?\n/);
+  const result = [];
+  let inCodeBlock = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 代码块边界跟踪——代码块内不做任何处理
+    if (line.match(/^```/)) {
+      inCodeBlock = !inCodeBlock;
+      // 清洗代码块语言标识后的 MDX 属性（如 ```bash theme={null} → ```bash）
+      if (!inCodeBlock) {
+        result.push(line);
+      } else {
+        const cleanedLang = line
+          .replace(/\\=/g, '=')                          // 还原转义的 =
+          .replace(/\s+theme\s*=\s*\{[^}]*\}/g, '')      // theme={null}
+          .replace(/\s+theme\s*=\s*\S+/g, '')             // theme=xxx（其他格式）
+          .replace(/\s+title\s*=\s*"[^"]*"/g, '')         // title="xxx"
+          .replace(/\s+title\s*=\s*\S+/g, '')             // title=xxx
+          .replace(/\s+cols\s*=\s*\{[^}]*\}/g, '')        // cols={2}
+          .replace(/\s+cols\s*=\s*\S+/g, '')              // cols=xxx
+          .replace(/\s*\{[^}]*\}\s*$/, '')                // 残留 {...}
+          .trim();
+        result.push(cleanedLang);
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      result.push(line);
+      continue;
+    }
+
+    // HTML 注释 → 移除
+    if (line.match(/^<!--.*-->$/)) continue;
+    if (line.match(/^<!--/)) {
+      while (i < lines.length && !lines[i].match(/-->/)) i++;
+      continue;
+    }
+
+    // MDX 提示组件 → 转为 callout（>! 格式）
+    const calloutMatch = line.match(/^<(Warning|Tip|Note|Caution|Info|Danger)\s*>(.*)$/i);
+    if (calloutMatch) {
+      const type = calloutMatch[1];
+      const rest = calloutMatch[2] ? calloutMatch[2].trim() : '';
+      const iconMap = { Warning: '⚠️', Tip: '💡', Note: '📝', Caution: '🔴', Info: 'ℹ️', Danger: '🚨' };
+      const icon = iconMap[type] || '📌';
+      const contentLines = rest ? [rest] : [];
+      while (i + 1 < lines.length && !lines[i + 1].match(new RegExp(`^</${type}>`, 'i'))) {
+        i++;
+        const inner = lines[i].replace(/<[^>]+>/g, '').trim();
+        if (inner) contentLines.push(inner);
+      }
+      if (i + 1 < lines.length) i++; // 跳过 </Tag>
+      result.push(`>! ${icon} ${contentLines.join(' ')}`);
+      continue;
+    }
+
+    // MDX 容器组件 → 跳过（含复杂 JSX 属性的标签，直接按行跳过）
+    if (line.match(/^<(CardGroup|Tabs|Steps|Accordion)\b/i)) continue;
+    if (line.match(/^<\/(CardGroup|Tabs|Steps|Accordion|Card|Tab|Step|AccordionItem)>\s*$/i)) continue;
+    if (line.match(/^\s*<Card\b/i)) continue;  // <Card 含复杂 JSX，整行跳过
+    if (line.match(/^\s*<\/Card>\s*$/i)) continue;
+    if (line.match(/^\s*<Tab\b/i)) continue;
+    if (line.match(/^\s*<\/Tab>\s*$/i)) continue;
+    // 多行 JSX 开标签（以 > 结尾的行，如 }>）
+    if (line.match(/^\s*>\s*$/)) continue;
+
+    // 其他行：移除残留 HTML/MDX 标签，还原转义字符
+    let cleaned = line
+      .replace(/<Card\b[^>]*>/gi, '')
+      .replace(/<\/Card>/gi, '')
+      .replace(/<Tab\b[^>]*>/gi, '')
+      .replace(/<\/Tab>/gi, '')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/^\s*\}>\s*$/gm, '')  // JSX 闭标签残留 }>
+      .replace(/\}>/g, '')            // 行内 }> 残留
+      .trim();
+
+    // 转义字符还原（代码块外）
+    cleaned = cleaned.replace(/\\([*_#`~[\]()!|])/g, '$1');
+
+    if (cleaned) result.push(cleaned);
+  }
+
+  return result.join('\n');
+}
+
+/**
  * 将 Markdown 文本解析为 FlowUs block 数组
  *
  * 支持的格式：
@@ -312,7 +531,9 @@ function parseInline(text) {
  * @returns {Array} block 数组
  */
 function mdToBlocks(md) {
-  const lines = md.split(/\r?\n/);
+  // 预处理：清洗 MDX/HTML 标签，还原转义字符
+  const cleaned = preprocessMd(md);
+  const lines = cleaned.split(/\r?\n/);
   const blocks = [];
   let i = 0;
 
@@ -581,8 +802,8 @@ function collectListItems(lines, startIdx, itemRe) {
  * @returns {object|null}
  */
 function parseTable(tblLines) {
-  // 过滤分隔行（|---|---|）
-  const dataLines = tblLines.filter(l => !/^\s*\|[\s:-|]+\|\s*$/.test(l));
+  // 过滤分隔行（|---|---| 或 |:---:|:---:|）
+  const dataLines = tblLines.filter(l => !/^[\s|:-]+$/.test(l));
   if (dataLines.length === 0) return null;
 
   const firstCells = dataLines[0].split('|').map(c => c.trim()).filter(c => c);
@@ -653,16 +874,17 @@ function isCodeExt(ext) {
  */
 async function findPageByTitle(dbId, title) {
   try {
-    const results = await rest.queryDatabase(dbId);
+    // 优先用 search API（精确匹配标题，无需全量拉取）
+    const results = await rest.search(title, {
+      pageSize: 10,
+      filter: { value: 'page', property: 'object' },
+    });
 
-    // 遍历所有记录，从 properties 中提取标题值进行匹配
     for (const r of results) {
       const props = r.properties || {};
-      // 尝试多种可能的标题属性名
       const titleProp = props.title || props['标题'] || props.Name || props.name;
       if (!titleProp) continue;
 
-      // 提取文本值
       const val = titleProp[titleProp.type];
       let text = '';
       if (Array.isArray(val)) {
@@ -676,12 +898,33 @@ async function findPageByTitle(dbId, title) {
       if (text === title) return r.id;
     }
 
+    // search 未命中，fallback 到 queryDatabase（仅 database 父级有效）
+    if (dbId) {
+      try {
+        const dbResults = await rest.queryDatabase(dbId);
+        for (const r of dbResults) {
+          const props = r.properties || {};
+          const titleProp = props.title || props['标题'] || props.Name || props.name;
+          if (!titleProp) continue;
+          const val = titleProp[titleProp.type];
+          let text = '';
+          if (Array.isArray(val)) {
+            text = val.map(v => v.plain_text || v.text?.content || '').join('');
+          } else if (typeof val === 'string') {
+            text = val;
+          } else if (val?.name) {
+            text = val.name;
+          }
+          if (text === title) return r.id;
+        }
+      } catch (e2) {
+        // database 查询失败（如父级是 page），静默忽略
+      }
+    }
+
     return null;
   } catch (e) {
-    // 父级为普通页面时 queryDatabase 必然失败（HTTP_400），不打印多余日志
-    if (!e.message.includes('不是数据库')) {
-      log(`查找页面失败: ${e.message.substring(0, 60)}`);
-    }
+    log(`查找页面失败: ${e.message.substring(0, 60)}`);
     return null;
   }
 }
@@ -689,7 +932,7 @@ async function findPageByTitle(dbId, title) {
 /**
  * 创建新页面（REST 版）
  *
- * 官方文档：POST /v1/pages
+ * 官方文档：POST /v2/pages
  *   - parent: { database_id } 或 { page_id }
  *   - properties: { 属性名: { type, [title|rich_text|select|...] } }
  *   - icon: { emoji } （可选）
@@ -702,28 +945,58 @@ async function findPageByTitle(dbId, title) {
  * @param {string} [options.coverUrl] - 封面图片 URL
  * @returns {Promise<string>} page_id
  */
+/**
+ * 获取数据库中标题属性的实际名称
+ * FlowUs V2 API 要求 properties 的 key 是数据库中的实际属性名（可能是中文），
+ * 不能硬编码为 "title"
+ */
+async function _getTitlePropName(databaseId) {
+  try {
+    const db = await rest.get(`/databases/${databaseId}`);
+    const props = db?.properties || {};
+    for (const [name, def] of Object.entries(props)) {
+      if (def.type === 'title') return name;
+    }
+  } catch (_) { /* fallback */ }
+  return 'title'; // fallback 到默认值
+}
+
 async function createPage(options) {
   const { parentDbId, parentId, title, icon, coverUrl, parentType = 'database' } = options;
 
-  // 支持两种父级类型：database（多维表）或 page（普通页面）
-  const parent = parentType === 'page'
-    ? { page_id: parentId || parentDbId }
-    : { database_id: parentDbId };
-
+  // 构建请求体
   const body = {
-    parent,
-    properties: {
-      title: {
-        type: 'title',
-        title: [rt(title)],
-      },
-    },
+    properties: {},
   };
 
-  // 可选：icon / cover
-  if (icon) body.icon = { emoji: icon };
-  if (coverUrl) body.cover = { external: { url: coverUrl } };
+  // parent 可选：不传则创建到工作区根目录
+  const effectiveParentId = parentType === 'page'
+    ? (parentId || parentDbId)
+    : parentDbId;
 
+  if (effectiveParentId) {
+    body.parent = parentType === 'page'
+      ? { page_id: effectiveParentId }
+      : { database_id: effectiveParentId };
+  }
+
+  // 获取标题属性的实际名称（数据库属性名可能是中文）
+  let titlePropName = 'title';
+  if (effectiveParentId && parentType !== 'page') {
+    titlePropName = await _getTitlePropName(effectiveParentId);
+  }
+
+  body.properties[titlePropName] = {
+    type: 'title',
+    title: [{ type: 'text', text: { content: title } }],
+  };
+
+  // 可选：icon / cover（官方文档要求 icon 含 type 字段）
+  if (icon) body.icon = { type: 'emoji', emoji: icon };
+  if (coverUrl) body.cover = { type: 'external', external: { url: coverUrl } };
+
+  // 注意：FlowUs API 当前不支持 Idempotency-Key header（会导致 500），
+  // 通过 findPageByTitle 去重检查防止重复创建
   const result = await rest.post('/pages', body);
 
   const pageId = result?.id || null;
@@ -737,7 +1010,7 @@ async function createPage(options) {
 /**
  * 更新页面属性（轻量更新，不重写块内容）
  *
- * 官方文档：PATCH /v1/pages/{page_id}
+ * 官方文档：PATCH /v2/pages/{page_id}
  *   - 可单独更新 icon, cover, properties（部分属性）
  *   - 不影响已有的子块内容
  *
@@ -750,8 +1023,8 @@ async function createPage(options) {
  */
 async function updatePageProperties(pageId, updates) {
   const body = {};
-  if (updates.icon) body.icon = { emoji: updates.icon };
-  if (updates.coverUrl) body.cover = { external: { url: updates.coverUrl } };
+  if (updates.icon) body.icon = { type: 'emoji', emoji: updates.icon };
+  if (updates.coverUrl) body.cover = { type: 'external', external: { url: updates.coverUrl } };
   if (updates.properties) body.properties = updates.properties;
 
   if (Object.keys(body).length === 0) {
@@ -779,41 +1052,73 @@ async function updatePageProperties(pageId, updates) {
  * @returns {Promise<number>} 成功写入的块数
  */
 async function appendBlocks(pageId, blocks, options = {}) {
-  const batchSize = options.batchSize || 100;
   const delayMs = options.delayMs || 300;
   let totalWritten = 0;
 
-  for (let i = 0; i < blocks.length; i += batchSize) {
-    const batch = blocks.slice(i, i + batchSize);
-    // 直接使用 REST API，无需格式转换
-    log(`  写入批次 ${Math.floor(i / batchSize) + 1}/${Math.ceil(blocks.length / batchSize)} (${batch.length} 个块)`);
+  // 按原始顺序逐段写入，table 块需要特殊处理（先创建 table，再追加 table_row）
+  // 为了效率，将连续的非 table 块批量写入，遇到 table 则先刷出当前批次
+  let batch = [];
 
-    try {
-      const result = await rest.patch(`/blocks/${pageId}/children`, { children: batch });
-
-      // REST 返回 { results: [...] }
-      const count = result?.results?.length || batch.length;
-      totalWritten += count;
-      log(`  ✓ 成功 ${count}/${batch.length}`);
-    } catch (e) {
-      log(`  ✗ 批次写入失败: ${e.message.substring(0, 100)}`);
-      // 逐个重试失败的批次
-      for (const b of batch) {
-        try {
-          await rest.patch(`/blocks/${pageId}/children`, { children: [b] });
-          totalWritten++;
-        } catch (e2) {
-          log(`    ✗ 单块写入失败 (${b.type}): ${e2.message.substring(0, 60)}`);
+  async function flushBatch() {
+    if (batch.length === 0) return;
+    // API 限制单次最多 100 个块，分批写入
+    const BATCH_SIZE = 100;
+    for (let i = 0; i < batch.length; i += BATCH_SIZE) {
+      const chunk = batch.slice(i, i + BATCH_SIZE);
+      try {
+        const result = await rest.patch(`/blocks/${pageId}/children`, { children: chunk });
+        totalWritten += result?.results?.length || 0;
+        log(`  ✓ 写入 ${result?.results?.length || 0}/${chunk.length} 个块`);
+      } catch (e) {
+        log(`  ✗ 批次写入失败: ${e.message.substring(0, 100)}`);
+        for (const b of chunk) {
+          try {
+            await rest.patch(`/blocks/${pageId}/children`, { children: [b] });
+            totalWritten++;
+          } catch (e2) {
+            log(`    ✗ 单块写入失败 (${b.type}): ${e2.message.substring(0, 60)}`);
+          }
+          await rest.sleep(50);
         }
-        await rest.sleep(50); // 单块间小间隔
       }
+      if (i + BATCH_SIZE < batch.length) await rest.sleep(delayMs);
     }
+    batch = [];
+    await rest.sleep(delayMs);
+  }
 
-    // 批间延迟（避免触发 100次/分的写入限速）
-    if (i + batchSize < blocks.length) {
+  for (const b of blocks) {
+    if (b.children && b.children.length > 0) {
+      // 先刷出当前普通块批次
+      await flushBatch();
+
+      // 单独创建 table 块
+      try {
+        const tableBlock = { object: 'block', type: b.type, [b.type]: b.data };
+        const createResult = await rest.patch(`/blocks/${pageId}/children`, { children: [tableBlock] });
+        const tableId = createResult?.results?.[0]?.id;
+        if (!tableId) {
+          log(`  ✗ table 创建失败：未返回 ID`);
+          continue;
+        }
+        totalWritten++;
+
+        // 追加 table_row
+        const rowBlocks = b.children.map(c => ({ object: 'block', type: c.type, [c.type]: c.data }));
+        const rowResult = await rest.patch(`/blocks/${tableId}/children`, { children: rowBlocks });
+        totalWritten += rowResult?.results?.length || 0;
+        log(`  ✓ 表格: ${rowResult?.results?.length || 0} 行`);
+      } catch (e) {
+        log(`  ✗ 表格创建失败: ${e.message.substring(0, 100)}`);
+      }
       await rest.sleep(delayMs);
+    } else {
+      batch.push(b);
     }
   }
+
+  // 刷出剩余普通块
+  await flushBatch();
 
   return totalWritten;
 }
@@ -904,212 +1209,21 @@ function extractTables(md) {
 }
 
 /**
- * 通过 MCP putMarkdown 写入页面内容（v3.0 默认模式）
+ * 写入页面内容（REST 块模式）
  *
- * 原理：将原始 Markdown 文本直接发送给 FlowUs 服务端解析，
- *       由服务端负责将 MD 转换为原生块结构。
- *
- * 核心优势（来自实战经验验证）：
- *   - 零格式损失：服务端原生解析器完整支持大部分 Markdown 语法
- *   - 无客户端 bug：绕过 mdToBlocks 解析器的所有潜在问题
- *   - 自动优化：服务端自动处理块合并、嵌套、特殊字符转义等
- *
- * 已知限制：
- *   - ❌ 不支持 GFM 表格语法（表格行变 paragraph，需后处理补入 table 块）
- *   - ❌ 不支持 HTML <table> 标签（同样变纯文本 paragraph）
- *
- * 对比 appendBlockChildren（REST 块模式）：
- *   - putMarkdown: 原始 MD → 服务端解析 → 页面（推荐，格式保真度高）
- *   - appendBlockChildren: 客户端构造 Block → API 逐块写入（适合精确控制）
+ * 策略：将 Markdown 转换为块结构，通过 REST API 追加到页面。
+ * 不再使用 MCP putMarkdown（FlowUs MCP Server 不提供 API-putMarkdown 工具）。
  *
  * @param {string} pageId - 目标页面 ID
- * @param {string} markdownContent - 原始 Markdown 文本
- * @returns {Promise<object>} API 返回结果
- */
-async function writeViaPutMarkdown(pageId, markdownContent) {
-  // 配置 MCP 客户端
-  mcp.configure({ token: TOKEN });
-
-  // 预热连接（建立 Session，指数退避重试）
-  log('  正在建立 MCP 连接（putMarkdown 模式）...');
-  const warmOk = await mcp.warmUp();
-  if (!warmOk) {
-    throw new Error('MCP Server 连接失败，无法使用 putMarkdown 模式');
-  }
-
-  // 调用 putMarkdown API（核心调用）
-  log(`  发送 Markdown 到服务端解析 (${markdownContent.length} 字符)...`);
-  const result = await mcp.mcpCall('API-putMarkdown', {
-    page_id: pageId,
-    body: { markdown: markdownContent },
-  });
-
-  log('  ✓ putMarkdown 写入完成');
-  return result;
-}
-
-/**
- * 混合写入模式（v3.1）：putMarkdown + 表格后处理
- *
- * 策略：
- *   1. 将原始 MD 直接通过 putMarkdown 发送到服务端（非表格内容零格式损失）
- *   2. 读取页面块，检测被 putMarkdown 错误渲染为 paragraph 的表格行（含 | 的行）
- *   3. 将连续的"假表格段落"分组，删除它们，用 REST API 插入真正的 table 块
- *
- * 为什么需要后处理：
- *   FlowUs putMarkdown 服务端解析器不支持 GFM 表格语法，
- *   表格行（| col | col |）会被当作普通 paragraph 块输出。
- *   同时 HTML 注释和 <table> 标签也均不被支持/会被剥离。
- *
- * @param {string} pageId - 目标页面 ID
- * @param {string} markdownContent - 原始 Markdown 文本（用于参考，判断是否有表格）
+ * @param {string} markdownContent - Markdown 文本
  * @returns {Promise<void>}
  */
-async function writeViaHybrid(pageId, markdownContent) {
-  // 先检查原始 MD 是否包含表格（避免无表格时做不必要的后处理）
-  const hasTable = /^\|.+\|$/m.test(markdownContent) || /^|.+\|$/m.test(markdownContent);
-
-  // Step 1: putMarkdown 写入原始内容
-  await writeViaPutMarkdown(pageId, markdownContent);
-
-  // 如果没有表格，直接返回
-  if (!hasTable) {
-    return;
+async function writeContent(pageId, markdownContent) {
+  const blocks = mdToBlocks(markdownContent);
+  if (blocks.length > 0) {
+    await appendBlocks(pageId, blocks);
+    log(`  ✓ REST 块模式写入 ${blocks.length} 个块`);
   }
-
-  // Step 2: 等待服务端处理完成
-  await rest.sleep(2000);
-
-  // Step 3: 读取所有子块（使用 REST 获取完整列表，MCP API 有分页限制）
-  log(`  📝 检测到原文包含表格，执行后处理...`);
-
-  let allBlocks = [];
-  try {
-    // 必须用 REST getAllBlocks 获取完整子块列表
-    // MCP 的 API-getBlockChildren 有分页限制（只返回前 ~20 个块），会遗漏大量内容
-    allBlocks = await rest.getAllBlocks(pageId);
-  } catch (e) {
-    log(`  ⚠️ 读取子块失败，跳过表格后处理: ${e.message.substring(0, 80)}`);
-    return;
-  }
-
-  if (allBlocks.length === 0) {
-    log('  页面无子块，跳过表格处理');
-    return;
-  }
-
-  // Step 4: 扫描所有 paragraph 块，找出"假表格段落"（内容包含 | 且看起来像表格行）
-  const tableRowPattern = /^\s*\|.*\|\s*$/;           // 表格数据行：| ... |
-  const separatorPattern = /^\s*\|[\s\-:|]+\|\s*$/;    // 分隔行：|---|---|
-
-  // 收集连续的假表格段落组
-  const fakeTableGroups = [];   // 每组: [{ blockIndex, blockId, content }, ...]
-  let currentGroup = null;
-
-  for (let bi = 0; bi < allBlocks.length; bi++) {
-    const b = allBlocks[bi];
-    if (b.type !== 'paragraph') {
-      // 非段落 → 结束当前组（如果有）
-      if (currentGroup && currentGroup.length >= 2) {
-        fakeTableGroups.push(currentGroup);
-      }
-      currentGroup = null;
-      continue;
-    }
-
-    // 提取段落文本（兼容 REST 格式 data: 和 MCP 格式 type_name:）
-    const text = b.data?.rich_text || b[b.type]?.rich_text || b.paragraph?.rich_text || [];
-    const content = Array.isArray(text)
-      ? text.map(t => t.plain_text || t.text?.content || '').join('')
-      : '';
-
-    // 判断是否是假表格行
-    if (tableRowPattern.test(content) || separatorPattern.test(content)) {
-      if (!currentGroup) currentGroup = [];
-      currentGroup.push({ blockIndex: bi, blockId: b.id, content });
-    } else {
-      // 非表格段落 → 结束当前组
-      if (currentGroup && currentGroup.length >= 2) {
-        fakeTableGroups.push(currentGroup);
-      }
-      currentGroup = null;
-    }
-  }
-
-  // 处理末尾的组
-  if (currentGroup && currentGroup.length >= 2) {
-    fakeTableGroups.push(currentGroup);
-  }
-
-  if (fakeTableGroups.length === 0) {
-    log('  未检测到被错误渲染的表格段落（可能 putMarkdown 已正确处理或表格格式不标准）');
-    return;
-  }
-
-  log(`  📊 检测到 ${fakeTableGroups.length} 组假表格段落，开始修复...`);
-
-  // Step 5: 逐组处理：删除假段落 → 构造真正 table 块 → 插入
-  let fixedCount = 0;
-
-  for (let gi = 0; gi < fakeTableGroups.length; gi++) {
-    const group = fakeTableGroups[gi];
-
-    // 过滤掉分隔行，只保留数据行
-    const dataLines = group
-      .filter(g => !separatorPattern.test(g.content))
-      .map(g => g.content);
-
-    if (dataLines.length < 2) {
-      continue; // 至少需要表头+1数据行
-    }
-
-    // 用 parseTable 构造表格结构（含 table_row children）
-    const tblBlock = parseTable(dataLines);
-    if (!tblBlock) {
-      log(`    ⚠️ 组 #${gi}: parseTable 解析失败 (${dataLines.length} 行)`);
-      continue;
-    }
-    const tableRows = tblBlock.children || [];
-
-    // 删除该组的所有假段落（从后往前删避免索引问题）
-    const idsToDelete = group.map(g => g.blockId);
-    for (let i = idsToDelete.length - 1; i >= 0; i--) {
-      try { await rest.del(`/blocks/${idsToDelete[i]}`); } catch (_) { /* ignore */ }
-      await rest.sleep(30);
-    }
-
-    // 两步法插入表格（FlowUs REST API 不支持嵌套 children）：
-    //   Step 1: 创建空 table 块
-    //   Step 2: 向 table 块追加 table_row 子块
-    try {
-      const emptyTable = {
-        type: 'table',
-        data: tblBlock.data,
-        // 不带 children — 先创建空表
-      };
-      const createResult = await rest.patch(`/blocks/${pageId}/children`, { children: [emptyTable] });
-      const createdIds = createResult.results || [];
-      if (createdIds.length === 0) {
-        log(`    ✗ 组 #${gi}: 创建空 table 失败（无返回 ID）`);
-        continue;
-      }
-      const tableId = createdIds[createdIds.length - 1].id; // 最后创建的就是 table
-
-      // Step 2: 追加 table_row 到 table 块
-      if (tableRows.length > 0) {
-        await rest.patch(`/blocks/${tableId}/children`, { children: tableRows });
-      }
-
-      log(`    ✓ 组 #${gi}: 已修复 (${dataLines.length} 行 → ${tblBlock.data.table_width}列, ${tableRows.length} rows)`);
-      fixedCount++;
-    } catch (e) {
-      log(`    ✗ 组 #${gi}: 插入失败: ${e.message.substring(0, 80)}`);
-    }
-
-    await rest.sleep(100);
-  }
-
-  log(`  ✓ 表格后处理完成：${fixedCount}/${fakeTableGroups.length} 个表格已修复`);
 }
 
 // ============== 主流程模式 ==============
@@ -1121,7 +1235,7 @@ async function writeViaHybrid(pageId, markdownContent) {
  *   - 默认（无 --blocks）：使用 putMarkdown（原始 MD → 服务端解析）
  *   - --blocks 标志：使用 REST appendBlockChildren（客户端 Block 构造）
  */
-async function modeUploadFile(opts) {
+async function modeUploadMdFile(opts, token) {
   const filePath = path.resolve(opts.filePath);
 
   if (!fs.existsSync(filePath)) {
@@ -1227,7 +1341,7 @@ async function modeUploadFile(opts) {
 
     // 写入（等待页面就绪 + MCP 连接）— 使用混合模式（自动处理表格）
     await rest.sleep(1500);
-    await writeViaHybrid(pageId, markdownContent);
+    await writeContent(pageId, markdownContent);
     out(`\n✅ [混合模式] 完成！已发送 ${markdownContent.length} 字符（含表格后处理）`);
   }
 
@@ -1238,7 +1352,7 @@ async function modeUploadFile(opts) {
 /**
  * 模式 B：直接写入文本
  */
-async function modeWriteText(opts) {
+async function modeWriteText(opts, token) {
   const text = opts.textContent;
   const title = opts.title || `笔记-${new Date().toISOString().slice(0, 10)}`;
 
@@ -1258,19 +1372,26 @@ async function modeWriteText(opts) {
       out(`✅ 新建: ${pageId}`);
     }
   } else {
-    pageId = await createPage({ parentDbId, title, icon: opts.icon, coverUrl: opts.coverUrl, parentType: opts.parentType });
-    out(`✅ 新建: ${pageId}`);
+    // 非更新模式也先检查是否已存在，避免重复创建
+    const canSearch = opts.parentType !== 'page';
+    if (canSearch) pageId = await findPageByTitle(parentDbId, title);
+    if (pageId) {
+      out(`⚠️ 页面已存在 (${pageId})，将在末尾追加内容。如需替换请使用 --update`);
+    } else {
+      pageId = await createPage({ parentDbId, title, icon: opts.icon, coverUrl: opts.coverUrl, parentType: opts.parentType });
+      out(`✅ 新建: ${pageId}`);
+    }
   }
 
-  const blocks = mdToBlocks(text);
-
   if (opts.dryRun) {
-    out(`\n[Dry Run] ${blocks.length} 个块`);
+    out(`\n[Dry Run] 将发送 ${text.length} 字符的 Markdown`);
     return;
   }
 
-  const written = await appendBlocks(pageId, blocks);
-  out(`\n✅ 完成！写入 ${written}/${blocks.length} 个块`);
+  // 使用 putMarkdown 混合模式（服务端解析，格式保真度最高）
+  await rest.sleep(1500);
+  await writeContent(pageId, text);
+  out(`\n✅ 完成！已发送 ${text.length} 字符（含表格后处理）`);
   out(`🔗 https://flowus.cn/${pageId.replace(/-/g, '')}`);
 }
 
@@ -1337,12 +1458,7 @@ async function modeUpdateProp(opts) {
   if (opts.setTitle !== null) {
     properties.title = {
       type: 'title',
-      title: [
-        { type: 'text', text: { content: opts.setTitle, link: null },
-          annotations: { bold: false, italic: false, strikethrough: false,
-            underline: false, code: false, color: 'default' },
-          plain_text: opts.setTitle, href: null }
-      ]
+      title: [{ type: 'text', text: { content: opts.setTitle } }],
     };
     hasUpdates = true;
   }
@@ -1375,7 +1491,7 @@ async function modeUpdateProp(opts) {
     const content = s.substring(idx + 1).trim();
     properties[name] = {
       type: 'rich_text',
-      rich_text: [{ type: 'text', text: { content, link: null } }]
+      rich_text: [{ text: { content } }]
     };
     hasUpdates = true;
   }
@@ -1383,8 +1499,8 @@ async function modeUpdateProp(opts) {
   // 更新属性
   const body = {};
   if (Object.keys(properties).length > 0) body.properties = properties;
-  if (opts.setIcon) { body.icon = { emoji: opts.setIcon }; hasUpdates = true; }
-  if (opts.setCover) { body.cover = { external: { url: opts.setCover } }; hasUpdates = true; }
+  if (opts.setIcon) { body.icon = { type: 'emoji', emoji: opts.setIcon }; hasUpdates = true; }
+  if (opts.setCover) { body.cover = { type: 'external', external: { url: opts.setCover } }; hasUpdates = true; }
 
   if (!hasUpdates) {
     out('错误: --update-prop 需要至少一个更新项，如 --set-title / --set-select / --set-checkbox 等');
@@ -1422,15 +1538,350 @@ async function modeDelete(opts) {
 
   if (!opts.force) {
     out(`\n⚠️  确认删除: ${id}`);
-    out(`  此操作不可逆！`);
+    out(`  此操作为软删除（移入回收站），可恢复。`);
     out(`  请加 --force 确认执行`);
     process.exit(1);
   }
 
   out(`\n🗑️  删除: ${id}`);
   try {
-    const result = await rest.del(`/blocks/${id}`);
-    out(`✅ 已删除`);
+    // 直接用 deletePage，页面和块都适用（底层都是同一 API）
+    const result = await rest.deletePage(id);
+    const objType = result?.object === 'block' ? '块' : '页面';
+    out(`✅ ${objType}已删除（移入回收站，可恢复）`);
+    return result;
+  } catch (e) {
+    out(`❌ 删除失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ============== 块级编辑模式 ==============
+
+/**
+ * 模式 F：--edit-block 更新单个块内容
+ *
+ * 官方文档：PATCH /v2/blocks/:block_id
+ * 更新块使用类型名展开格式，如 { paragraph: { rich_text: [...] } }
+ *
+ * 支持：
+ *   - --text "新内容"：更新段落/标题/代码块的文本
+ *   - --checked true/false：更新待办块的勾选状态
+ */
+async function modeEditBlock(opts) {
+  const blockId = opts.editBlockId;
+  if (!blockId) {
+    out('错误: --edit-block 需要块 ID');
+    process.exit(1);
+  }
+
+  // 先获取块信息，确定块类型
+  out(`\n✏️  编辑块: ${blockId}`);
+  let blockInfo;
+  try {
+    blockInfo = await rest.getBlock(blockId);
+  } catch (e) {
+    out(`❌ 获取块信息失败: ${e.message}`);
+    process.exit(1);
+  }
+
+  const blockType = blockInfo?.type;
+  if (!blockType) {
+    out(`❌ 无法确定块类型`);
+    process.exit(1);
+  }
+
+  out(`  块类型: ${blockType}`);
+
+  // 构建更新数据
+  const updateData = {};
+
+  if (opts.editBlockText !== null) {
+    const text = opts.editBlockText;
+
+    if (['paragraph', 'heading_1', 'heading_2', 'heading_3', 'quote', 'callout'].includes(blockType)) {
+      updateData[blockType] = { rich_text: splitRichText(text) };
+    } else if (blockType === 'code') {
+      updateData[blockType] = { rich_text: [{ text: { content: text } }] };
+    } else if (blockType === 'to_do') {
+      updateData[blockType] = { rich_text: splitRichText(text) };
+    } else {
+      out(`⚠️  块类型 "${blockType}" 的文本更新暂不支持，尝试通用更新`);
+      updateData[blockType] = { rich_text: splitRichText(text) };
+    }
+  }
+
+  if (opts.editChecked !== null) {
+    if (blockType === 'to_do') {
+      const checked = opts.editChecked.toLowerCase() === 'true';
+      updateData[blockType] = updateData[blockType] || {};
+      updateData[blockType].checked = checked;
+    } else {
+      out(`⚠️  --checked 仅适用于 to_do 块，当前块类型: ${blockType}`);
+    }
+  }
+
+  if (Object.keys(updateData).length === 0) {
+    out('错误: --edit-block 需要至少一个更新项，如 --text "新内容" 或 --checked true');
+    process.exit(1);
+  }
+
+  try {
+    const result = await rest.updateBlock(blockId, updateData);
+    out(`✅ 块已更新`);
+    return result;
+  } catch (e) {
+    out(`❌ 更新失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * 模式 G：--delete-block 删除单个块
+ *
+ * 官方文档：DELETE /v2/blocks/:block_id
+ * 软删除，块移入回收站可恢复
+ */
+async function modeDeleteBlock(opts) {
+  const blockId = opts.deleteBlockId;
+  if (!blockId) {
+    out('错误: --delete-block 需要块 ID');
+    process.exit(1);
+  }
+
+  if (!opts.force) {
+    out(`\n⚠️  确认删除块: ${blockId}`);
+    out(`  此操作为软删除（移入回收站），可恢复。`);
+    out(`  请加 --force 确认执行`);
+    process.exit(1);
+  }
+
+  out(`\n🗑️  删除块: ${blockId}`);
+  try {
+    const result = await rest.deleteBlock(blockId);
+    out(`✅ 块已删除（移入回收站，可恢复）`);
+    return result;
+  } catch (e) {
+    out(`❌ 删除失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ============== 文件上传模式 ==============
+
+/**
+ * 模式 H：--upload 上传本地文件到 FlowUs 页面
+ *
+ * 官方文档：
+ *   1. POST /v2/files/upload-url → 获取预签名 URL
+ *   2. PUT 文件到预签名 URL
+ *   3. 追加 image/file 块到页面
+ *
+ * 图片文件 → image 块（内联显示）
+ * 其他文件 → file 块（附件形式）
+ */
+async function modeUploadFile(opts) {
+  const filePath = opts.uploadFilePath;
+  if (!filePath) {
+    out('错误: --upload 需要文件路径');
+    process.exit(1);
+  }
+
+  const resolvedPath = path.resolve(filePath);
+  if (!fs.existsSync(resolvedPath)) {
+    out(`错误: 文件不存在: ${resolvedPath}`);
+    process.exit(1);
+  }
+
+  const parentDbId = opts.parentDbId || DEFAULT_PARENT_DB;
+  if (!parentDbId) {
+    out('错误: --upload 需要指定目标页面（--parent <pageId>）');
+    process.exit(1);
+  }
+
+  const fileName = path.basename(resolvedPath);
+  const ext = path.extname(fileName).toLowerCase();
+  const isImage = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'].includes(ext);
+
+  out(`\n📤 上传文件: ${resolvedPath}`);
+  out(`📄 目标页面: ${parentDbId}`);
+  out(`📝 类型: ${isImage ? '图片' : '文件'}`);
+
+  try {
+    // 上传文件
+    const uploadResult = await rest.uploadFile({
+      filePath: resolvedPath,
+      pageId: parentDbId,
+    });
+
+    out(`✅ 文件已上传: ${uploadResult.file_url}`);
+
+    // 追加对应的块到页面
+    let blockData;
+    if (isImage) {
+      blockData = {
+        object: 'block',
+        type: 'image',
+        image: {
+          type: 'file',
+          file: { url: uploadResult.file_url },
+        },
+      };
+    } else {
+      blockData = {
+        object: 'block',
+        type: 'file',
+        file: {
+          type: 'file',
+          file: { url: uploadResult.file_url },
+        },
+      };
+    }
+
+    const appendResult = await rest.patch(`/blocks/${parentDbId}/children`, { children: [blockData] });
+    out(`✅ ${isImage ? '图片' : '文件'}块已追加到页面`);
+    out(`📄 页面 ID: ${parentDbId}`);
+    out(`🔗 https://flowus.cn/${parentDbId.replace(/-/g, '')}`);
+
+    return appendResult;
+  } catch (e) {
+    out(`❌ 上传失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// ============== 数据库管理模式 ==============
+
+/**
+ * 模式 I：--create-db 创建数据库
+ *
+ * 官方文档：POST /v2/databases
+ *   - parent: { page_id: 'xxx' }
+ *   - title: [{ text: { content: '数据库名' } }]
+ *   - properties: { 属性名: { type: 'title'/'select'/... } }
+ */
+async function modeCreateDb(opts) {
+  const parentId = opts.createDbParentId;
+  if (!parentId) {
+    out('错误: --create-db 需要父页面 ID');
+    process.exit(1);
+  }
+
+  const title = opts.title || '新数据库';
+  let properties;
+  if (opts.dbProps) {
+    try {
+      properties = JSON.parse(opts.dbProps);
+    } catch (e) {
+      out(`错误: --db-props JSON 解析失败: ${e.message}`);
+      process.exit(1);
+    }
+    // 补全 name 字段（官方文档要求每个属性含 name 字段）
+    for (const [key, val] of Object.entries(properties)) {
+      if (!val.name) val.name = key;
+    }
+  } else {
+    // 默认属性：一个标题列
+    properties = { '名称': { name: '名称', type: 'title' } };
+  }
+
+  out(`\n📊 创建数据库`);
+  out(`📄 父页面: ${parentId}`);
+  out(`📝 标题: ${title}`);
+  out(`📋 属性: ${Object.keys(properties).join(', ')}`);
+
+  try {
+    const result = await rest.createDatabase({
+      parent: { page_id: parentId },
+      title: [{ text: { content: title } }],
+      properties,
+      ...(opts.icon ? { icon: { type: 'emoji', emoji: opts.icon } } : {}),
+    });
+
+    const dbId = result?.id;
+    out(`✅ 数据库已创建: ${dbId}`);
+    out(`🔗 https://flowus.cn/${(dbId || '').replace(/-/g, '')}`);
+    return result;
+  } catch (e) {
+    out(`❌ 创建失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * 模式 J：--update-db 更新数据库 schema
+ *
+ * 官方文档：PATCH /v2/databases/:database_id
+ *   - title: 更新标题
+ *   - properties: 添加/修改属性（不能删除属性，只能添加）
+ */
+async function modeUpdateDb(opts) {
+  const dbId = opts.updateDbId;
+  if (!dbId) {
+    out('错误: --update-db 需要数据库 ID');
+    process.exit(1);
+  }
+
+  const updates = {};
+  if (opts.title) {
+    updates.title = [{ text: { content: opts.title } }];
+  }
+  if (opts.dbProps) {
+    try {
+      updates.properties = JSON.parse(opts.dbProps);
+      // 补全 name 字段
+      for (const [key, val] of Object.entries(updates.properties)) {
+        if (!val.name) val.name = key;
+      }
+    } catch (e) {
+      out(`错误: --db-props JSON 解析失败: ${e.message}`);
+      process.exit(1);
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    out('错误: --update-db 需要至少一个更新项（--title 或 --db-props）');
+    process.exit(1);
+  }
+
+  out(`\n📊 更新数据库: ${dbId}`);
+  if (updates.title) out(`  标题: ${opts.title}`);
+  if (updates.properties) out(`  新属性: ${Object.keys(updates.properties).join(', ')}`);
+
+  try {
+    const result = await rest.updateDatabase(dbId, updates);
+    out(`✅ 数据库已更新`);
+    return result;
+  } catch (e) {
+    out(`❌ 更新失败: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * 模式 K：--delete-db 删除数据库
+ *
+ * 官方文档：DELETE /v2/databases/:database_id
+ * 软删除，移入回收站可恢复
+ */
+async function modeDeleteDb(opts) {
+  const dbId = opts.deleteDbId;
+  if (!dbId) {
+    out('错误: --delete-db 需要数据库 ID');
+    process.exit(1);
+  }
+
+  if (!opts.force) {
+    out(`\n⚠️  确认删除数据库: ${dbId}`);
+    out(`  此操作为软删除（移入回收站），可恢复。`);
+    out(`  请加 --force 确认执行`);
+    process.exit(1);
+  }
+
+  out(`\n🗑️  删除数据库: ${dbId}`);
+  try {
+    const result = await rest.deleteDatabase(dbId);
+    out(`✅ 数据库已删除（移入回收站，可恢复）`);
     return result;
   } catch (e) {
     out(`❌ 删除失败: ${e.message}`);
@@ -1442,69 +1893,60 @@ async function modeDelete(opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
-  // Token 验证
-  if (!TOKEN) {
-    out('错误: 未设置 FLOWUS_TOKEN 环境变量');
+  // --help 优先处理
+  if (opts.help) {
+    out(HELP_TEXT.trim());
+    process.exit(0);
+  }
+
+  // Token 解析（--token > 环境变量 > .env）
+  const token = _resolveToken(opts.token);
+  if (!token) {
+    out('错误: 缺少 FlowUs 授权 token');
     out('');
-    out('用法:');
-    out('  set FLOWUS_TOKEN=your_token_here    (Windows CMD)');
-    out('  $env:FLOWUS_TOKEN="your_token"       (PowerShell)');
-    out('  export FLOWUS_TOKEN=your_token       (Bash/Zsh)');
+    out('解决方法（按优先级）:');
+    out('  1. 使用 --token <你的token> 参数传入');
+    out('  2. 设置环境变量 FLOWUS_TOKEN');
+    out('  3. 在当前目录创建 .env 文件，内容: FLOWUS_TOKEN=你的token');
     process.exit(1);
   }
 
   // 配置
-  rest.configure({ token: TOKEN });
+  rest.configure({ token: token });
 
-  // 帮助
-  if (!opts.filePath && !opts.textContent && !opts.rawBlocks && !opts.updatePropId && !opts.deleteId) {
-    out(`
-FlowUs 写入脚本 v3.0（双模式架构 + 属性更新 + 删除）
-
-写入模式:
-  默认模式: putMarkdown（原始 MD → 服务端解析，格式保真度最高）✅ 推荐
-  --blocks:  REST 块模式（客户端构造 Block，精确控制块结构）
-
-属性管理:
-  --update-prop <pageId> --set-title "标题"    更新页面标题
-  --update-prop <pageId> --set-select "状态:已完成"  更新 select 字段
-  --update-prop <pageId> --set-checkbox "完成:true"  更新复选框
-  --update-prop <pageId> --set-text "描述:内容"    更新富文本字段
-  --update-prop <pageId> --set-icon "📝" --set-cover "url"  更新图标封面
-
-删除:
-  --delete <pageId/blockId> --force  删除页面或块（不可逆）
-
-用法:
-  node flowus-write.js <文件.md> [标题]           上传文件（默认 putMarkdown）
-  node flowus-write.js --parent <id> <文件>       指定目标位置
-  node flowus-write.js --parent-type page <文件>  父级为普通页面
-  node flowus-write.js --update <文件> [标题]     更新已有页面
-  node flowus-write.js --dry-run <文件>           只解析不写入
-
-支持的 Markdown 格式:
-  # ## ### 标题    **粗体** *斜体* \`代码\`
-  \`\`\`代码块\`\`\`   > 引用   >! 标注   --- 分隔线
-  - 无序列表   1. 有序列表   - [x] 待办   | 表格
-  ![图片](url)  [书签](url)
-
-环境变量:
-  FLOWUS_TOKEN  授权码（必需）
-`);
+  // 无操作模式时显示帮助
+  if (!opts.filePath && !opts.textContent && !opts.rawBlocks && !opts.rawFilePath
+      && !opts.updatePropId && !opts.deleteId
+      && !opts.editBlockId && !opts.deleteBlockId
+      && !opts.uploadFilePath
+      && !opts.createDbParentId && !opts.updateDbId && !opts.deleteDbId) {
+    out(HELP_TEXT.trim());
     process.exit(0);
   }
 
   // 分发
-  if (opts.deleteId) {
+  if (opts.deleteDbId) {
+    await modeDeleteDb(opts);
+  } else if (opts.updateDbId) {
+    await modeUpdateDb(opts);
+  } else if (opts.createDbParentId) {
+    await modeCreateDb(opts);
+  } else if (opts.uploadFilePath) {
+    await modeUploadFile(opts);
+  } else if (opts.deleteBlockId) {
+    await modeDeleteBlock(opts);
+  } else if (opts.editBlockId) {
+    await modeEditBlock(opts);
+  } else if (opts.deleteId) {
     await modeDelete(opts);
   } else if (opts.updatePropId) {
     await modeUpdateProp(opts);
   } else if (opts.rawBlocks || opts.rawFilePath) {
     await modeWriteRaw(opts);
   } else if (opts.textContent !== null) {
-    await modeWriteText(opts);
+    await modeWriteText(opts, token);
   } else if (opts.filePath) {
-    await modeUploadFile(opts);
+    await modeUploadMdFile(opts, token);
   }
 }
 

@@ -39,8 +39,23 @@ const https = require('https');
 const rest = require('./lib/rest-client');
 
 // ============== 配置 ==============
-/** Token 必须通过环境变量 FLOWUS_TOKEN 提供 */
-const TOKEN = process.env.FLOWUS_TOKEN;
+/**
+ * Token 解析优先级（从高到低）：
+ *   1. --token <xxx> 命令行参数（Agent 显式传入）
+ *   2. FLOWUS_TOKEN 环境变量（手动终端测试）
+ *   3. 当前工作目录下 .env 文件（Agent 首次授权后缓存）
+ */
+function _resolveToken(cliToken) {
+  if (cliToken) return cliToken;
+  if (process.env.FLOWUS_TOKEN) return process.env.FLOWUS_TOKEN;
+  try {
+    const envPath = path.join(process.cwd(), '.env');
+    const content = fs.readFileSync(envPath, 'utf8');
+    const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
+    if (m) return m[1].trim();
+  } catch (_) { /* .env 不存在则忽略 */ }
+  return null;
+}
 /** 默认剪藏数据库（可通过环境变量 FLOWUS_CLIP_DB 覆盖，或通过 --db 指定） */
 const DEFAULT_DB_ID = process.env.FLOWUS_CLIP_DB || '';
 /** 剪藏数据库 ID（用于 --clip 模式，可被 --db 覆盖） */
@@ -55,6 +70,36 @@ function log(msg) {
 function out(msg) {
   console.log(msg);
 }
+
+// ============== 帮助信息 ==============
+const HELP_TEXT = `
+FlowUs 下载导出脚本 v1.0
+
+用法:
+  node flowus-download.js --id <pageId>              导出单页
+  node flowus-download.js --db <dbId> 10             导出最新 10 条
+  node flowus-download.js --db <dbId> --all          导出全部
+  node flowus-download.js --db <dbId> --keyword xxx  搜索导出
+  node flowus-download.js --clip [N]                 导出剪藏最新 N 条
+  node flowus-download.js --clip --all               导出全部剪藏
+  node flowus-download.js --images                   同时下载图片
+  node flowus-download.js --output ./exports         自定义输出目录
+
+参数:
+  --id <pageId>       页面 ID（单页导出）
+  --db <dbId>         数据库 ID
+  --clip              剪藏模式
+  --all               导出全部
+  --keyword <词>      搜索过滤
+  --images [dir]      同时下载图片（可指定图片目录）
+  --output <dir>      输出目录
+  --md-dir <dir>      MD 文件输出目录
+  --img-dir <dir>     图片输出目录
+  --from <日期>       起始日期过滤
+  --to <日期>         结束日期过滤
+  --token <授权码>    FlowUs 授权 token
+  --help              显示此帮助信息
+`;
 
 // ============== 参数解析 ==============
 function parseArgs(argv) {
@@ -72,11 +117,16 @@ function parseArgs(argv) {
     imgDir: null,      // --img-dir <dir>（图片输出目录）
     downloadImages: false, // --images
     raw: false,        // --raw
+    token: null,       // --token <授权码>
+    from: null,        // --from YYYY-MM-DD
+    to: null,          // --to YYYY-MM-DD
+    help: false,       // --help
   };
-
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--id') { opts.pageId = argv[++i]; }
+    if (a === '--help' || a === '-h') { opts.help = true; }
+    else if (a === '--id') { opts.pageId = argv[++i]; }
+    else if (a === '--token') { opts.token = argv[++i] || ''; }
     else if (a === '--db') { opts.dbId = argv[++i]; }
     else if (a === '--all') { opts.all = true; }
     else if (a === '--clip') { opts.clipMode = true; }
@@ -93,6 +143,8 @@ function parseArgs(argv) {
     }
     else if (a === '--keyword') { opts.keywords.push(...(argv[++i] || '').toLowerCase().split(/\s+/).filter(Boolean)); }
     else if (a === '--raw') { opts.raw = true; }
+    else if (a === '--from') { opts.from = argv[++i]; }
+    else if (a === '--to') { opts.to = argv[++i]; }
     else if (/^\d+$/.test(a)) { opts.count = parseInt(a, 10); }
   }
 
@@ -135,9 +187,28 @@ function getPropValue(props, ...names) {
       case 'select': return val.name || null;
       case 'multi_select': return val.map(x => x.name).join(', ') || null;
       case 'number': return String(val);
-      case 'date': return val.start || String(val);
+      case 'date': {
+        if (!val) return null;
+        const s = val.start || '';
+        const e = val.end || '';
+        if (s && e) return `${s} ~ ${e}`;
+        return s || String(val);
+      }
       case 'url': return String(val);
+      case 'email': return String(val);
+      case 'phone_number': return String(val);
       case 'checkbox': return val ? '✅' : '⬜';
+      case 'people': return Array.isArray(val) ? val.map(p => p.name || p.id).join(', ') : (val?.name || null);
+      case 'files': return Array.isArray(val) ? val.map(f => f.file?.name || f.file?.url || '文件').join(', ') : null;
+      case 'relation': return Array.isArray(val) ? val.length + ' 条关联' : null;
+      case 'formula': return val?.string || val?.number != null ? String(val?.number ?? val?.string ?? '') : null;
+      case 'rollup': return Array.isArray(val?.array) ? val.array.length + ' 项' : null;
+      case 'created_time':
+      case 'last_edited_time':
+        return typeof val === 'string' ? val.substring(0, 10) : String(val);
+      case 'created_by':
+      case 'last_edited_by':
+        return val?.name || val?.id || null;
       default: return typeof val === 'object' ? JSON.stringify(val) : String(val);
     }
   }
@@ -299,47 +370,58 @@ function blocksToMarkdown(blocks, options = {}) {
         }
         break;
       }
-      case 'bookmark':
-        lines.push(`\n[${text}](${data.url || ''})`);
-        break;
-      case 'embed':
-        lines.push(`\n[embed](${data.url || ''})`);
-        break;
-      case 'table': {
-        // 表格头：输出列数信息，后续 table_row 输出具体行
-        const width = data.table_width || 0;
-        if (width > 0) {
-          lines.push(`<!-- TABLE_START:${width} -->`);
-        }
+      case 'bookmark': {
+        const bmCaption = extractRichText(data.caption);
+        lines.push(`\n[${bmCaption || text}](${data.url || ''})`);
         break;
       }
+      case 'embed': {
+        const emCaption = extractRichText(data.caption);
+        lines.push(`\n[embed${emCaption ? ': ' + emCaption : ''}](${data.url || ''})`);
+        break;
+      }
+      case 'table':
+        // table 块只记录列数，不输出内容
+        break;
       case 'table_row':
-        // 表格行：提取单元格文本，首行自动加分隔线（始终把第一行当表头）
+        // 表格行：提取单元格文本，首行自动加分隔线
         if (data.cells && Array.isArray(data.cells)) {
           const rowStr = data.cells.map(cell =>
             extractRichText(cell).replace(/\|/g, '\\|').trim()
           ).join(' | ');
-          const line = `| ${rowStr} |`;
-          lines.push(line);
-          // 检查上一行是否是 TABLE_START 标记，如果是则在第一行后插入分隔线
-          const prevIdx = lines.length - 2;
-          if (prevIdx >= 0 && lines[prevIdx].startsWith('<!-- TABLE_START:')) {
+          lines.push(`| ${rowStr} |`);
+          // 首行（上一行不是表格行）后插入分隔线
+          const prevLine = lines.length >= 2 ? lines[lines.length - 2] : '';
+          if (prevLine && !prevLine.startsWith('|')) {
             const colCount = data.cells.length;
-            lines[prevIdx] = ''; // 清除标记
-            lines.splice(prevIdx + 2, 0, '| ' + Array(colCount).fill('---').join(' | ') + ' |');
+            lines.push('| ' + Array(colCount).fill('---').join(' | ') + ' |');
           }
-        } else {
-          // table_row 无 cells 数据，跳过
         }
         break;
       case 'toggle': {
         const summary = text || '(折叠内容)';
         lines.push(`<details>\n<summary>${summary}</summary>`);
-        // toggle 的 children 需要递归处理，这里简化为标记
-        lines.push(`\n(折叠块内容需展开查看)`);
+        // toggle 的子块已通过 expandNestedBlocks 展开到后续位置，此处只输出标签
         lines.push(`\n</details>`);
         break;
       }
+      case 'equation': {
+        const expr = data.expression || '';
+        if (expr) lines.push(`\n$$\n${expr}\n$$`);
+        break;
+      }
+      case 'link_to_page': {
+        const pid = data.page_id || data.database_id || '';
+        const label = data.database_id ? '数据库引用' : '页面引用';
+        lines.push(`\n[${label}](${pid})`);
+        break;
+      }
+      case 'column_list':
+        // 分栏布局容器，子块已通过 expandNestedBlocks 展开
+        break;
+      case 'column':
+        // 分栏列，子块已通过 expandNestedBlocks 展开
+        break;
       case 'child_page':
         // 子页面引用，跳过
         break;
@@ -369,8 +451,9 @@ async function searchInBody(pageId, keywords) {
 }
 
 /**
- * 展开嵌套子块（一层），扁平化插入
- * 对 has_children=true 的块（如 table），获取其子块并插入到该块后面
+ * 展开嵌套子块（递归），扁平化插入
+ * 对 has_children=true 的块（如 table、toggle、callout），获取其子块并插入到该块后面
+ * 使用 rest.getAllBlocks 确保翻页获取全部子块
  * @param {Array} blocks - 顶层块列表
  * @returns {Promise<Array>} 扁平化后的块列表
  */
@@ -378,7 +461,7 @@ async function expandNestedBlocks(blocks) {
   const needExpand = blocks.filter(b => b.has_children && !b.children?.length);
   if (needExpand.length === 0) return blocks;
 
-  log(`  展开 ${needExpand.length} 个嵌套块（table 等）...`);
+  log(`  展开 ${needExpand.length} 个嵌套块...`);
   const result = [...blocks];
 
   for (let i = 0; i < result.length; i++) {
@@ -386,12 +469,12 @@ async function expandNestedBlocks(blocks) {
     if (!b.has_children || b.children?.length) continue;
 
     try {
-      const res = await rest.get(`/blocks/${b.id}/children?page_size=100`);
-      const children = res.results || [];
+      // 使用 getAllBlocks 确保翻页获取全部子块
+      const children = await rest.getAllBlocks(b.id);
       b.children = children;
       if (children.length > 0) {
         result.splice(i + 1, 0, ...children);
-        i += children.length;
+        // 不跳过子块，让循环继续检查子块是否也需要展开（递归）
       }
     } catch (e) {
       log(`    展开 ${b.type}(${b.id}) 失败: ${e.message.substring(0, 60)}`);
@@ -536,11 +619,9 @@ async function downloadImages(imageList, baseDir, customImgDir) {
 async function exportPage(pageId, outputDir, options = {}) {
   log(`  正在读取页面: ${pageId}`);
 
-  // 获取页面信息（REST）和块列表（REST，更可靠：分页稳定、data 格式统一）
-  const [pageDetail, blocks] = await Promise.all([
-    (async()=>{ try { return await rest.get('/pages/' + pageId); } catch(e) { return null; } })(),
-    rest.getAllBlocks(pageId),
-  ]);
+  // 获取页面信息
+  let pageDetail = null;
+  try { pageDetail = await rest.get('/pages/' + pageId); } catch(e) { /* ignore */ }
 
   // 确定标题
   let title = '(无标题)';
@@ -548,27 +629,17 @@ async function exportPage(pageId, outputDir, options = {}) {
     const t = getTitle(pageDetail.properties);
     if (t !== '(无标题)') title = t;
   }
-  if (title === '(无标题)') {
-    for (const b of blocks) {
-      if (['heading_1', 'heading_2'].includes(b.type)) {
-        const t = extractBlockText(b);
-        if (t) { title = t; break; }
-      }
-    }
-  }
 
   // 确定保存目录
   const saveMdDir = options.mdDir || outputDir;
   const saveImgDir = (options.downloadImages && options.imgDir) ? path.resolve(options.imgDir) : null;
 
-  // 图片在 MD 中的引用方式：
-  //   - 绝对路径（如 F:/obsidian/assets）→ Obsidian wiki-link：![[文件名.png]]
-  //   - 相对路径 → 标准 Markdown：![](相对路径/文件名.png)
+  // 图片在 MD 中的引用方式
   let imageDir = null;
   if (saveImgDir) {
     const isAbs = /^[A-Za-z]:[/\\]/.test(saveImgDir) || saveImgDir.startsWith('/');
     if (isAbs) {
-      imageDir = saveImgDir; // 绝对路径，触发 blocksToMarkdown 的 wiki-link 分支
+      imageDir = saveImgDir;
     } else {
       imageDir = path.relative(saveMdDir, saveImgDir).replace(/\\/g, '/');
     }
@@ -576,9 +647,39 @@ async function exportPage(pageId, outputDir, options = {}) {
     imageDir = options.imageDir || 'images';
   }
 
-  // Blocks → Markdown（展开嵌套子块如 table_row）
-  const expandedBlocks = await expandNestedBlocks(blocks);
-  const { md: bodyMd, imageUrls } = blocksToMarkdown(expandedBlocks, { imageDir });
+  // 优先使用 Markdown API（V2 扩展接口），失败时 fallback 到手动转换
+  let bodyMd = '';
+  let imageUrls = [];
+
+  if (!options.downloadImages) {
+    // 不需要下载图片时，优先用 Markdown API
+    try {
+      const mdResult = await rest.getPageMarkdown(pageId);
+      if (mdResult?.markdown) {
+        bodyMd = mdResult.markdown;
+        log('  使用 Markdown API 读取成功');
+      }
+    } catch (e) {
+      log(`  Markdown API 不可用，fallback 到手动转换: ${e.message.substring(0, 60)}`);
+    }
+  }
+
+  if (!bodyMd) {
+    // Fallback：手动获取块并转换
+    const blocks = await rest.getAllBlocks(pageId);
+    if (title === '(无标题)') {
+      for (const b of blocks) {
+        if (['heading_1', 'heading_2'].includes(b.type)) {
+          const t = extractBlockText(b);
+          if (t) { title = t; break; }
+        }
+      }
+    }
+    const expandedBlocks = await expandNestedBlocks(blocks);
+    const result = blocksToMarkdown(expandedBlocks, { imageDir });
+    bodyMd = result.md;
+    imageUrls = result.imageUrls;
+  }
 
   // 清洗微信剪藏混入的垃圾文字
   const cleanedBody = cleanWechatArtifacts(bodyMd);
@@ -631,7 +732,16 @@ async function exportDatabaseRecords(dbId, outputDir, options = {}) {
   const count = options.count || (options.all ? 999999 : 1);
 
   log(`正在查询数据库: ${dbId}`);
-  const records = await restQueryAllRecords(dbId);
+
+  // 构建 filterBody：将 --from 转为服务端过滤参数
+  const filterBody = {};
+  if (options.from) {
+    const ts = Math.floor(new Date(options.from + 'T00:00:00+08:00').getTime() / 1000);
+    filterBody.after_created_at = ts;
+  }
+
+  const records = await rest.queryDatabase(dbId, Object.keys(filterBody).length > 0 ? filterBody : undefined);
+  records.sort((a, b) => new Date(b.created_time || 0) - new Date(a.created_time || 0));
 
   // 关键词过滤
   let filtered = records;
@@ -646,6 +756,12 @@ async function exportDatabaseRecords(dbId, outputDir, options = {}) {
       if (inMeta || inBody) matched.push(r);
     }
     filtered = matched;
+  }
+
+  // --to 日期过滤（本地过滤，API 不支持"早于"）
+  if (options.to) {
+    const ts = new Date(options.to + 'T23:59:59+08:00').getTime();
+    filtered = filtered.filter(r => new Date(r.created_time || 0).getTime() <= ts);
   }
 
   // 按 created_time 降序排序（最新在前）
@@ -830,19 +946,27 @@ async function modeClip(opts) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
+  // --help 优先处理
+  if (opts.help) {
+    out(HELP_TEXT.trim());
+    process.exit(0);
+  }
+
   // Token 验证（剪藏/数据库/单页模式需要 Token）
   const needsToken = opts.clipMode || opts.pageId || opts.dbId;
-  if (!TOKEN && needsToken) {
-    out('错误: 未设置 FLOWUS_TOKEN 环境变量');
+  const token = _resolveToken(opts.token);
+  if (!token && needsToken) {
+    out('错误: 缺少 FlowUs 授权 token');
     out('');
-    out('用法:');
-    out('  $env:FLOWUS_TOKEN="your_token"    (PowerShell)');
-    out('  export FLOWUS_TOKEN=your_token    (Bash)');
+    out('解决方法（按优先级）:');
+    out('  1. 使用 --token <你的token> 参数传入');
+    out('  2. 设置环境变量 FLOWUS_TOKEN');
+    out('  3. 在当前目录创建 .env 文件，内容: FLOWUS_TOKEN=你的token');
     process.exit(1);
   }
 
   // 配置客户端
-  rest.configure({ token: TOKEN || '' });
+  rest.configure({ token: token || '' });
 
   // 确定输出目录
   const outputDir = opts.outputDir || DEFAULT_OUTPUT_DIR;
@@ -879,6 +1003,8 @@ async function main() {
     all: opts.all,
     keywords: opts.keywords,
     downloadImages: opts.downloadImages,
+    from: opts.from,
+    to: opts.to,
   });
 
   if (results.length > 0) {
