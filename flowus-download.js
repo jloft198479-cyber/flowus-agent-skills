@@ -48,12 +48,18 @@ const rest = require('./lib/rest-client');
 function _resolveToken(cliToken) {
   if (cliToken) return cliToken;
   if (process.env.FLOWUS_TOKEN) return process.env.FLOWUS_TOKEN;
-  try {
-    const envPath = path.join(process.cwd(), '.env');
-    const content = fs.readFileSync(envPath, 'utf8');
-    const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
-    if (m) return m[1].trim();
-  } catch (_) { /* .env 不存在则忽略 */ }
+  // 从 .env 读取：优先工作目录，回退到脚本自身目录
+  const envPaths = [
+    path.join(process.cwd(), '.env'),
+    path.join(__dirname, '.env'),
+  ];
+  for (const envPath of envPaths) {
+    try {
+      const content = fs.readFileSync(envPath, 'utf8');
+      const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
+      if (m) return m[1].trim();
+    } catch (_) { /* .env 不存在则忽略 */ }
+  }
   return null;
 }
 /** 默认剪藏数据库（可通过环境变量 FLOWUS_CLIP_DB 覆盖，或通过 --db 指定） */

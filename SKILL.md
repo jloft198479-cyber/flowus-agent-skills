@@ -6,6 +6,39 @@
 >
 > **API 版本**: FlowUs V2 (`/v2` 前缀) | **Token 传递**：支持 `--token` 参数、环境变量、`.env` 文件三层自动解析
 
+## ⚠️ 工具选择规则（必读）
+
+> **Agent 必须严格遵守以下规则，违反将导致操作失败。**
+
+### 核心原则：CLI 脚本优先，MCP 工具仅作只读辅助
+
+| 操作类型 | 必须使用 | 禁止使用 | 原因 |
+|----------|---------|---------|------|
+| **写入**（创建/更新/删除页面、块、数据库） | **CLI 脚本** (`node flowus-write.js`) | ❌ MCP 工具 | MCP 工具的 schema 校验与 FlowUs 实际 API 有差异，合法请求会被拦截 |
+| **读取**（查询数据库、读取页面、搜索） | **CLI 脚本** (`node flowus-read.js`) | MCP 工具（可作补充） | CLI 脚本功能更完整，支持 filter/sort/语义搜索等高级特性 |
+| **下载导出** | **CLI 脚本** (`node flowus-download.js`) | ❌ MCP 工具 | 下载功能仅 CLI 提供 |
+| **文件上传** | **CLI 脚本** (`node flowus-write.js --upload`) | ❌ MCP 工具 | 上传流程（预签名 URL → PUT → 追加块）仅 CLI 实现 |
+| **数据库管理**（创建/更新/删除数据库） | **CLI 脚本** (`node flowus-write.js --create-db` 等) | ❌ MCP 工具 | MCP `createDatabase` 的 schema 校验会拒绝合法的 properties 格式 |
+
+### 为什么 MCP 工具不适合写入操作？
+
+1. **Schema 校验过严**：MCP 工具的 input schema 与 FlowUs 实际 API 存在差异，合法的请求参数会被 MCP 层拦截返回校验错误
+2. **参数格式限制**：MCP 工具对 properties、filter 等复杂参数的格式要求比实际 API 更严格，导致本应成功的操作反复失败
+3. **功能缺失**：MCP 工具不支持文件上传、数据库管理、块级编辑等 V4.0 新增功能
+
+### 执行模板
+
+```bash
+# ✅ 正确：用 CLI 脚本操作
+node flowus-write.js --create-db <pageId> --title "数据库名" --db-props '{"名称":{"type":"title"}}'
+node flowus-write.js --db <dbId> --title "标题" --text "正文"
+node flowus-read.js --db <dbId> --list --sort created_time:desc
+
+# ❌ 错误：用 MCP 工具操作（会失败）
+# 调用 MCP createDatabase / createPage / updatePage 等写入工具
+```
+
+
 ---
 
 ## 架构总览
@@ -111,6 +144,7 @@ export FLOWUS_CLIP_DB=your_clip_db_id
 | "删除某个块" | `node flowus-write.js --delete-block <blockId> --force` |
 | "上传本地图片/文件" | `node flowus-write.js --upload <文件路径> --parent <pageId>` |
 | "创建数据库" | `node flowus-write.js --create-db <pageId> --title "数据库名" --db-props '{"名称":{"type":"title"}}'` |
+| "创建行内数据库" | `node flowus-write.js --create-db <pageId> --title "数据库名" --db-props-file props.json --inline` |
 | "给数据库添加属性" | `node flowus-write.js --update-db <dbId> --db-props '{"新字段":{"type":"rich_text"}}'` |
 | "删除数据库" | `node flowus-write.js --delete-db <dbId> --force` |
 | "导出为本地 .md 文件" | `node flowus-download.js --db <id> [N] --output ./dir` |
@@ -134,7 +168,8 @@ export FLOWUS_CLIP_DB=your_clip_db_id
 **V4.0 新特性**：
 - **块级编辑**：`--edit-block` 更新单个块内容，`--delete-block` 删除单个块（无需清空整页）
 - **文件上传**：`--upload` 上传本地图片/文件到 FlowUs 页面（自动获取预签名 URL → PUT → 追加块）
-- **数据库管理**：`--create-db` 创建数据库，`--update-db` 添加属性，`--delete-db` 删除数据库
+- **数据库管理**：`--create-db` 创建数据库（`--inline` 行内模式），`--update-db` 添加属性，`--delete-db` 删除数据库
+- **属性文件读取**：`--db-props-file` 从 JSON 文件读取数据库属性，避免 PowerShell 引号转义问题
 - **纯 REST 块模式写入**：Markdown → mdToBlocks → appendBlocks，不依赖 MCP
 - **`--title` / `--text` 分离**：`--title` 设置页面标题，`--text` 设置页面正文内容
 - **`--db` 统一参数**：`--db` 作为 `--parent` 的别名，与 read.js 保持一致
@@ -162,7 +197,7 @@ node flowus-write.js --icon 📝 --cover https://img.url/cover.png file.md "带�
 # 目标控制
 node flowus-write.js --db <dbId> file.md              # 写入指定数据库（--db 是 --parent 的别名）
 node flowus-write.js --parent <dbId> file.md           # 同上
-node flowus-write.js --parent-type page <文件>          # 父级为普通页面
+node flowus-write.js --parent-type page <文件>          # 父级为普通页面（不指定时自动检测）
 node flowus-write.js --update file.md "标题"            # 更新模式（清空后重写）
 
 # 属性更新（--update-prop + 具体操作）
@@ -187,7 +222,9 @@ node flowus-write.js --upload ./doc.pdf --parent <pageId>       # 上传文件�
 
 # 数据库管理（V4.0 新增）
 node flowus-write.js --create-db <pageId> --title "项目看板" --db-props '{"名称":{"type":"title"},"状态":{"type":"select"}}'
+node flowus-write.js --create-db <pageId> --title "项目看板" --db-props-file props.json --inline  # 行内数据库，属性从文件读取
 node flowus-write.js --update-db <dbId> --db-props '{"优先级":{"type":"select"}}'  # 添加属性
+node flowus-write.js --update-db <dbId> --db-props-file props.json  # 从文件读取属性
 node flowus-write.js --update-db <dbId> --title "新名称"       # 重命名
 node flowus-write.js --delete-db <dbId> --force                # 删除数据库
 
@@ -208,7 +245,8 @@ node flowus-write.js --dry-run file.md               # 只解析不写入
 - 单次追加 ≤ 100 子块（自动分批）
 - 写入限速 ~100 次/分（内置 delay）
 - **创建页面 properties 格式**：属性 key 必须是数据库中的实际属性名（如 `标题`），不是固定的 `title`。`_getTitlePropName()` 会自动查询数据库 schema 获取标题属性名
-- **父级为普通页面时**：parent 用 `{ page_id: "xxx" }`，不用 database_id
+- **父级为普通页面时**：parent 用 `{ page_id: "xxx" }`，不用 database_id；且创建时不传 properties（FlowUs API 拒绝），标题通过创建后 PATCH /pages/{id} 设置
+- **自动检测父级类型**：指定 --parent 但不指定 --parent-type 时，脚本自动 GET /pages/{id} 和 /databases/{id} 检测父级是页面还是数据库
 - **icon 格式**：`{ type: 'emoji', emoji: '📝' }`（必须含 `type` 字段）
 - **cover 格式**：`{ type: 'external', external: { url: 'https://...' } }`（必须含 `type` 和 `external` 嵌套）
 

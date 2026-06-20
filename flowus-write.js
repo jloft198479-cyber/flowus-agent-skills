@@ -48,13 +48,18 @@ const rest = require('./lib/rest-client');
 function _resolveToken(cliToken) {
   if (cliToken) return cliToken;
   if (process.env.FLOWUS_TOKEN) return process.env.FLOWUS_TOKEN;
-  // 从工作目录的 .env 读取（Agent workspace 下缓存）
-  try {
-    const envPath = path.join(process.cwd(), '.env');
-    const content = fs.readFileSync(envPath, 'utf8');
-    const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
-    if (m) return m[1].trim();
-  } catch (_) { /* .env 不存在则忽略 */ }
+  // 从 .env 读取：优先工作目录，回退到脚本自身目录
+  const envPaths = [
+    path.join(process.cwd(), '.env'),
+    path.join(__dirname, '.env'),
+  ];
+  for (const envPath of envPaths) {
+    try {
+      const content = fs.readFileSync(envPath, 'utf8');
+      const m = content.match(/^FLOWUS_TOKEN\s*=\s*(.+)$/m);
+      if (m) return m[1].trim();
+    } catch (_) { /* .env 不存在则忽略 */ }
+  }
   return null;
 }
 /** 默认父级数据库（可通过环境变量 FLOWUS_DEFAULT_PARENT 覆盖，或通过 --parent 指定） */
@@ -85,7 +90,9 @@ FlowUs 写入脚本 v4.0（纯 REST 块模式 + 块编辑 + 文件上传 + 数�
 
 数据库管理:
   --create-db <pageId> --title "数据库名" --db-props '{"名称":{"type":"title"},"状态":{"type":"select"}}'
+  --create-db <pageId> --title "数据库名" --db-props-file props.json --inline  创建行内数据库
   --update-db <dbId> --db-props '{"新字段":{"type":"rich_text"}}'  添加数据库属性
+  --update-db <dbId> --db-props-file props.json  从文件读取属性
   --delete-db <dbId> --force               删除数据库
 
 属性管理:
@@ -112,6 +119,8 @@ FlowUs 写入脚本 v4.0（纯 REST 块模式 + 块编辑 + 文件上传 + 数�
   --text <内容>        页面正文内容
   --icon <emoji>      页面图标
   --cover <url>       页面封面
+  --db-props-file <文件>  从 JSON 文件读取数据库属性（避免 PowerShell 转义问题）
+  --inline            创建行内数据库（is_inline: true）
   --token <授权码>     FlowUs 授权 token
   --help              显示此帮助信息
 
@@ -163,6 +172,8 @@ function parseArgs(argv) {
     updateDbId: null,       // --update-db <dbId>
     deleteDbId: null,       // --delete-db <dbId>
     dbProps: null,          // --db-props <JSON>
+    dbPropsFile: null,      // --db-props-file <文件路径>
+    inlineDb: false,        // --inline（创建行内数据库）
     token: null,        // --token <授权码>
     help: false,        // --help
   };
@@ -238,6 +249,10 @@ function parseArgs(argv) {
       opts.deleteDbId = argv[++i] || '';
     } else if (a === '--db-props') {
       opts.dbProps = argv[++i] || '';
+    } else if (a === '--db-props-file') {
+      opts.dbPropsFile = argv[++i] || '';
+    } else if (a === '--inline') {
+      opts.inlineDb = true;
     } else if (!a.startsWith('--')) {
       positional.push(a);
     }
@@ -961,13 +976,41 @@ async function _getTitlePropName(databaseId) {
   return 'title'; // fallback 到默认值
 }
 
+/**
+ * 自动检测父级类型（page 或 database）
+ *
+ * 当用户只传了 --parent <id> 但没指定 --parent-type 时调用。
+ * 依次尝试 GET /pages/{id} 和 GET /databases/{id} 判断类型。
+ *
+ * @param {string} id - 父级 ID
+ * @returns {Promise<'page'|'database'>} 默认 'database'
+ */
+async function detectParentType(id) {
+  try {
+    const r = await rest.get(`/pages/${id}`);
+    if (r && r.id) {
+      log(`  自动检测: ${id} 是页面 (page)`);
+      return 'page';
+    }
+  } catch (_) { /* 不是 page */ }
+
+  try {
+    const r = await rest.get(`/databases/${id}`);
+    if (r && r.id) {
+      log(`  自动检测: ${id} 是数据库 (database)`);
+      return 'database';
+    }
+  } catch (_) { /* 也不是 database */ }
+
+  log(`  自动检测失败: ${id} 无法识别，默认按 database 处理`);
+  return 'database';
+}
+
 async function createPage(options) {
   const { parentDbId, parentId, title, icon, coverUrl, parentType = 'database' } = options;
 
   // 构建请求体
-  const body = {
-    properties: {},
-  };
+  const body = {};
 
   // parent 可选：不传则创建到工作区根目录
   const effectiveParentId = parentType === 'page'
@@ -980,28 +1023,47 @@ async function createPage(options) {
       : { database_id: effectiveParentId };
   }
 
-  // 获取标题属性的实际名称（数据库属性名可能是中文）
-  let titlePropName = 'title';
-  if (effectiveParentId && parentType !== 'page') {
-    titlePropName = await _getTitlePropName(effectiveParentId);
-  }
-
-  body.properties[titlePropName] = {
-    type: 'title',
-    title: [{ type: 'text', text: { content: title } }],
-  };
-
-  // 可选：icon / cover（官方文档要求 icon 含 type 字段）
+  // 可选：icon / cover
   if (icon) body.icon = { type: 'emoji', emoji: icon };
   if (coverUrl) body.cover = { type: 'external', external: { url: coverUrl } };
 
-  // 注意：FlowUs API 当前不支持 Idempotency-Key header（会导致 500），
-  // 通过 findPageByTitle 去重检查防止重复创建
+  // 标题处理：
+  //   - database：通过 properties[titlePropName] 设置（属性名可能是中文）
+  //   - page：FlowUs API 不接受 properties，创建后用 PATCH 设置标题
+  if (parentType !== 'page') {
+    let titlePropName = 'title';
+    if (effectiveParentId) {
+      titlePropName = await _getTitlePropName(effectiveParentId);
+    }
+    body.properties = {
+      [titlePropName]: {
+        type: 'title',
+        title: [{ type: 'text', text: { content: title } }],
+      },
+    };
+  }
+
   const result = await rest.post('/pages', body);
 
   const pageId = result?.id || null;
   if (!pageId) {
     throw new Error(`创建页面失败: ${JSON.stringify(result).substring(0, 200)}`);
+  }
+
+  // parentType === 'page' 时，创建后用 PATCH 设置标题
+  if (parentType === 'page' && title) {
+    try {
+      await rest.patch(`/pages/${pageId}`, {
+        properties: {
+          title: {
+            type: 'title',
+            title: [{ type: 'text', text: { content: title } }],
+          },
+        },
+      });
+    } catch (e) {
+      log(`  ⚠️ 设置页面标题失败（页面已创建）: ${e.message.substring(0, 80)}`);
+    }
   }
 
   return pageId;
@@ -1769,11 +1831,23 @@ async function modeCreateDb(opts) {
 
   const title = opts.title || '新数据库';
   let properties;
-  if (opts.dbProps) {
+  const propsSource = opts.dbPropsFile || opts.dbProps;
+  if (propsSource) {
+    let propsJson;
+    if (opts.dbPropsFile) {
+      try {
+        propsJson = fs.readFileSync(opts.dbPropsFile, 'utf-8');
+      } catch (e) {
+        out(`错误: --db-props-file 读取失败: ${e.message}`);
+        process.exit(1);
+      }
+    } else {
+      propsJson = opts.dbProps;
+    }
     try {
-      properties = JSON.parse(opts.dbProps);
+      properties = JSON.parse(propsJson);
     } catch (e) {
-      out(`错误: --db-props JSON 解析失败: ${e.message}`);
+      out(`错误: 数据库属性 JSON 解析失败: ${e.message}`);
       process.exit(1);
     }
     // 补全 name 字段（官方文档要求每个属性含 name 字段）
@@ -1789,12 +1863,14 @@ async function modeCreateDb(opts) {
   out(`📄 父页面: ${parentId}`);
   out(`📝 标题: ${title}`);
   out(`📋 属性: ${Object.keys(properties).join(', ')}`);
+  if (opts.inlineDb) out(`📌 类型: 行内数据库 (is_inline)`);
 
   try {
     const result = await rest.createDatabase({
       parent: { page_id: parentId },
       title: [{ text: { content: title } }],
       properties,
+      ...(opts.inlineDb ? { is_inline: true } : {}),
       ...(opts.icon ? { icon: { type: 'emoji', emoji: opts.icon } } : {}),
     });
 
@@ -1826,15 +1902,27 @@ async function modeUpdateDb(opts) {
   if (opts.title) {
     updates.title = [{ text: { content: opts.title } }];
   }
-  if (opts.dbProps) {
+  const updatePropsSource = opts.dbPropsFile || opts.dbProps;
+  if (updatePropsSource) {
+    let updatePropsJson;
+    if (opts.dbPropsFile) {
+      try {
+        updatePropsJson = fs.readFileSync(opts.dbPropsFile, 'utf-8');
+      } catch (e) {
+        out(`错误: --db-props-file 读取失败: ${e.message}`);
+        process.exit(1);
+      }
+    } else {
+      updatePropsJson = opts.dbProps;
+    }
     try {
-      updates.properties = JSON.parse(opts.dbProps);
+      updates.properties = JSON.parse(updatePropsJson);
       // 补全 name 字段
       for (const [key, val] of Object.entries(updates.properties)) {
         if (!val.name) val.name = key;
       }
     } catch (e) {
-      out(`错误: --db-props JSON 解析失败: ${e.message}`);
+      out(`错误: 数据库属性 JSON 解析失败: ${e.message}`);
       process.exit(1);
     }
   }
@@ -1913,6 +2001,12 @@ async function main() {
 
   // 配置
   rest.configure({ token: token });
+
+  // 自动检测父级类型：用户指定了 --parent 但没指定 --parent-type 时，
+  // 自动 GET 检测是 page 还是 database，避免误判导致 properties 格式错误
+  if (opts.parentDbId && !opts.parentType) {
+    opts.parentType = await detectParentType(opts.parentDbId);
+  }
 
   // 无操作模式时显示帮助
   if (!opts.filePath && !opts.textContent && !opts.rawBlocks && !opts.rawFilePath
