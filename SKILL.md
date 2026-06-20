@@ -177,7 +177,7 @@ export FLOWUS_CLIP_DB=your_clip_db_id
 - **软删除**：`--delete` / `--delete-block` / `--delete-db` 操作均为软删除（移入回收站），可恢复
 - **429 限流自动重试**：写入操作也支持限流退避
 
-> ⚠️ **Idempotency-Key 不可用**：FlowUs API 当前不支持 `Idempotency-Key` header，使用会导致 HTTP 500。
+> ⚠️ **Idempotency-Key 幂等创建**：FlowUs API 支持 `POST /v2/pages` 的 `Idempotency-Key` header 实现幂等创建。相同键 + 相同请求体会返回相同结果，避免重试导致重复创建。脚本已在 `createPage` 中自动生成 UUID v4 作为幂等键。
 
 ```bash
 # Markdown 上传（最常用）
@@ -222,6 +222,8 @@ node flowus-write.js --upload ./doc.pdf --parent <pageId>       # 上传文件�
 
 # 数据库管理（V4.0 新增）
 node flowus-write.js --create-db <pageId> --title "项目看板" --db-props '{"名称":{"type":"title"},"状态":{"type":"select"}}'
+# select/multi_select 类型需传完整 options 结构（每个选项含 name 和 color）
+node flowus-write.js --create-db <pageId> --title "项目看板" --db-props '{"名称":{"type":"title"},"状态":{"type":"select","select":{"options":[{"name":"待办","color":"grey"},{"name":"进行中","color":"blue"},{"name":"完成","color":"green"}]}}}'
 node flowus-write.js --create-db <pageId> --title "项目看板" --db-props-file props.json --inline  # 行内数据库，属性从文件读取
 node flowus-write.js --update-db <dbId> --db-props '{"优先级":{"type":"select"}}'  # 添加属性
 node flowus-write.js --update-db <dbId> --db-props-file props.json  # 从文件读取属性
@@ -235,6 +237,8 @@ node flowus-write.js --raw-file blocks.json "标题"   # 推荐：从文件读�
 # 调试
 node flowus-write.js --dry-run file.md               # 只解析不写入
 ```
+
+> **select/multi_select 类型**：必须传 `select.options` 数组，每个选项含 `name` 和 `color`。可选 color：grey/blue/red/green/yellow/purple/pink/brown。
 
 **写入格式规范（实测验证）：**
 - **写入模式**：统一 REST 块模式（mdToBlocks + appendBlocks），不使用 MCP putMarkdown（MCP Server 不提供该工具）
@@ -250,9 +254,11 @@ node flowus-write.js --dry-run file.md               # 只解析不写入
 - **icon 格式**：`{ type: 'emoji', emoji: '📝' }`（必须含 `type` 字段）
 - **cover 格式**：`{ type: 'external', external: { url: 'https://...' } }`（必须含 `type` 和 `external` 嵌套）
 
-**支持的块类型（15 种）：**
+**支持的块类型（18 种，对齐官方可写类型）：**
 heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, to_do,
-code, callout, quote, divider, image, bookmark, table(+table_row), toggle, child_page
+code, callout, quote, divider, image, bookmark, embed, table(+table_row), toggle, equation, link_to_page
+
+> 注：`child_page`、`child_database`、`template`、`synced_block`、`column_list`、`column` 为官方只读类型，不可通过 API 写入。
 
 ### 2. flowus-read.js — 读取（V2）
 
@@ -394,11 +400,15 @@ node flowus-write.js --text "总结内容" "总结"
 | 错误现象 | 可能原因 | 解决方式 |
 |----------|---------|----------|
 | `缺少 FlowUs 授权 token` | 未提供 token（参数/环境变量/.env 均无） | 用 `--token <token>` 传入，或写入 `.env` 文件 |
-| `HTTP_401/403` | Token 无效或过期 | 向用户重新索取 token |
+| `HTTP_401` | Token 无效、过期或格式错误 | 检查 Authorization 头格式为 `Bearer <token>`，向用户重新索取 token |
+| `HTTP_403`（所有接口） | 免费计划或 scope 不足 | 个人/团队免费版均不可用，需升级付费计划；或检查 token 是否具备对应 scope |
+| `HTTP_403`（Markdown API） | 缺少 `pages.read` 或 `blocks.read` | Markdown API 需同时具备两个 scope，检查 token 的 capabilities |
 | `validation_error (HTTP_400)` | properties 属性名不匹配数据库 schema | 属性 key 必须是数据库中的实际属性名（如 `标题`），不是固定的 `title` |
-| `HTTP_500`（创建页面时） | 使用了 Idempotency-Key header | FlowUs API 不支持 Idempotency-Key，移除该 header |
+| `idempotency_conflict (HTTP_409)` | 相同 Idempotency-Key 对应了不同请求体 | 重试时保持请求体一致，或生成新的 Idempotency-Key |
+| `conflict (HTTP_409)` | 并发冲突（If-Match 乐观锁） | 页面已被其他人修改，重新读取后再更新 |
 | `TOOL_ERROR(404)` | 页面/数据库 ID 不存在 | 检查 ID |
 | `REQUEST_TIMEOUT` | 网络超时或页面过大 | 增大超时或分批处理 |
+| 错误信息含 `[request_id: xxx]` | 服务端返回的请求追踪 ID | 排查问题时将 request_id 提供给 FlowUs 官方 |
 
 ---
 

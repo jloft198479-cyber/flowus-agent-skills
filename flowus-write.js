@@ -92,7 +92,10 @@ FlowUs 写入脚本 v4.0（纯 REST 块模式 + 块编辑 + 文件上传 + 数�
   --create-db <pageId> --title "数据库名" --db-props '{"名称":{"type":"title"},"状态":{"type":"select"}}'
   --create-db <pageId> --title "数据库名" --db-props-file props.json --inline  创建行内数据库
   --update-db <dbId> --db-props '{"新字段":{"type":"rich_text"}}'  添加数据库属性
-  --update-db <dbId> --db-props-file props.json  从文件读取属性
+  --update-db <dbId> --db-props '{"旧字段":null}'  删除数据库属性（传 null）
+  --update-db <dbId> --title "新名称" --description "描述"  更新标题和描述
+  --update-db <dbId> --set-icon "🗂️" --set-cover "url"  更新图标封面
+  --update-db <dbId> --restore  从回收站恢复已删除数据库
   --delete-db <dbId> --force               删除数据库
 
 属性管理:
@@ -174,6 +177,8 @@ function parseArgs(argv) {
     dbProps: null,          // --db-props <JSON>
     dbPropsFile: null,      // --db-props-file <文件路径>
     inlineDb: false,        // --inline（创建行内数据库）
+    dbDescription: null,    // --description <描述>（更新数据库描述）
+    dbRestore: false,       // --restore（恢复已删除的数据库，设置 in_trash: false）
     token: null,        // --token <授权码>
     help: false,        // --help
   };
@@ -253,6 +258,10 @@ function parseArgs(argv) {
       opts.dbPropsFile = argv[++i] || '';
     } else if (a === '--inline') {
       opts.inlineDb = true;
+    } else if (a === '--description') {
+      opts.dbDescription = argv[++i] || '';
+    } else if (a === '--restore') {
+      opts.dbRestore = true;
     } else if (!a.startsWith('--')) {
       positional.push(a);
     }
@@ -700,18 +709,27 @@ function mdToBlocks(md) {
       continue;
     }
 
-    // ---- 6.6. 行内公式 $...$ 和块公式 $$...$$ ----
+    // ---- 6.6. 公式：单行块 $$...$$、行内 $...$、多行块 $$\n...\n$$ ----
+    // 单行块公式 $$...$$（需在行内 $...$ 之前检查，避免误匹配）
+    const singleBlockEq = line.match(/^\$\$(.+)\$\$$/);
+    if (singleBlockEq) {
+      blocks.push(block('equation', { expression: singleBlockEq[1] }));
+      i++;
+      continue;
+    }
+    // 行内公式 $...$
     const inlineEqMatch = line.match(/^\$(.+)\$$/);
     if (inlineEqMatch && !line.startsWith('$$')) {
       blocks.push(block('equation', { expression: inlineEqMatch[1] }));
       i++;
       continue;
     }
-    const blockEqStart = line.match(/^\$\s*$/);
+    // 多行块公式 $$ ... $$
+    const blockEqStart = line.match(/^\$\$\s*$/);
     if (blockEqStart) {
       i++;
       const eqLines = [];
-      while (i < lines.length && !lines[i].match(/^\$\s*$/)) {
+      while (i < lines.length && !lines[i].match(/^\$\$\s*$/)) {
         eqLines.push(lines[i]);
         i++;
       }
@@ -768,6 +786,36 @@ function mdToBlocks(md) {
         url: bmMatch[2],
         caption: parseInline(bmMatch[1]),
       }));
+      i++; continue;
+    }
+
+    // ---- 10.5. 嵌入块 ![embed](url) 或 ![embed:caption](url) ----
+    const embedMatch = line.match(/^!\[embed(?::([^\]]*))?\]\(([^)]+)\)\s*$/i);
+    if (embedMatch) {
+      blocks.push(block('embed', {
+        url: embedMatch[2],
+        caption: embedMatch[1] ? parseInline(embedMatch[1]) : [],
+      }));
+      i++; continue;
+    }
+
+    // ---- 10.6. 页面/数据库链接块 [page:页面ID](id) 或 [db:数据库ID](id) ----
+    const linkMatch = line.match(/^\[(page|db|database):([^\]]+)\]\(([^)]+)\)\s*$/i);
+    if (linkMatch) {
+      const prefix = linkMatch[1].toLowerCase();
+      const targetId = linkMatch[3];
+      // link_to_page 根据前缀区分 page_id / database_id
+      if (prefix === 'db' || prefix === 'database') {
+        blocks.push(block('link_to_page', {
+          type: 'database_id',
+          database_id: targetId,
+        }));
+      } else {
+        blocks.push(block('link_to_page', {
+          type: 'page_id',
+          page_id: targetId,
+        }));
+      }
       i++; continue;
     }
 
@@ -1043,7 +1091,23 @@ async function createPage(options) {
     };
   }
 
-  const result = await rest.post('/pages', body);
+  // 官方文档：POST /v2/pages 支持 Idempotency-Key 幂等创建
+  // 相同 Idempotency-Key + 相同请求体 → 返回相同结果，避免重试导致重复创建
+  // fallback：若 API 回归导致 500，去掉 header 重试一次，避免每次创建都失败
+  const { randomUUID } = require('crypto');
+  const idempotencyKey = randomUUID();
+  let result;
+  try {
+    result = await rest.post('/pages', body, {
+      headers: { 'Idempotency-Key': idempotencyKey },
+    });
+  } catch (e) {
+    if (e.message && e.message.includes('HTTP_500')) {
+      result = await rest.post('/pages', body);
+    } else {
+      throw e;
+    }
+  }
 
   const pageId = result?.id || null;
   if (!pageId) {
@@ -1779,6 +1843,7 @@ async function modeUploadFile(opts) {
     out(`✅ 文件已上传: ${uploadResult.file_url}`);
 
     // 追加对应的块到页面
+    // 官方文档：创建文件、图片、音频或视频块时传 oss_name，不要把兼容字段 file_url 当作 external URL 使用
     let blockData;
     if (isImage) {
       blockData = {
@@ -1786,7 +1851,7 @@ async function modeUploadFile(opts) {
         type: 'image',
         image: {
           type: 'file',
-          file: { url: uploadResult.file_url },
+          file: { url: uploadResult.oss_name },
         },
       };
     } else {
@@ -1795,7 +1860,7 @@ async function modeUploadFile(opts) {
         type: 'file',
         file: {
           type: 'file',
-          file: { url: uploadResult.file_url },
+          file: { url: uploadResult.oss_name },
         },
       };
     }
@@ -1889,7 +1954,10 @@ async function modeCreateDb(opts) {
  *
  * 官方文档：PATCH /v2/databases/:database_id
  *   - title: 更新标题
- *   - properties: 添加/修改属性（不能删除属性，只能添加）
+ *   - description: 更新描述
+ *   - icon / cover: 更新图标封面
+ *   - properties: 添加/修改属性；某个 schema 传 null 可删除该字段
+ *   - in_trash: 切换回收站状态（--restore 恢复已删除数据库）
  */
 async function modeUpdateDb(opts) {
   const dbId = opts.updateDbId;
@@ -1901,6 +1969,19 @@ async function modeUpdateDb(opts) {
   const updates = {};
   if (opts.title) {
     updates.title = [{ text: { content: opts.title } }];
+  }
+  if (opts.dbDescription) {
+    updates.description = [{ text: { content: opts.dbDescription } }];
+  }
+  if (opts.setIcon) {
+    updates.icon = { type: 'emoji', emoji: opts.setIcon };
+  }
+  if (opts.setCover) {
+    updates.cover = { type: 'external', external: { url: opts.setCover } };
+  }
+  if (opts.dbRestore) {
+    // 恢复已删除的数据库（设置 in_trash: false）
+    updates.in_trash = false;
   }
   const updatePropsSource = opts.dbPropsFile || opts.dbProps;
   if (updatePropsSource) {
@@ -1917,9 +1998,9 @@ async function modeUpdateDb(opts) {
     }
     try {
       updates.properties = JSON.parse(updatePropsJson);
-      // 补全 name 字段
+      // 补全 name 字段（null 值表示删除该属性，跳过 name 补全）
       for (const [key, val] of Object.entries(updates.properties)) {
-        if (!val.name) val.name = key;
+        if (val !== null && !val.name) val.name = key;
       }
     } catch (e) {
       out(`错误: 数据库属性 JSON 解析失败: ${e.message}`);
@@ -1928,13 +2009,23 @@ async function modeUpdateDb(opts) {
   }
 
   if (Object.keys(updates).length === 0) {
-    out('错误: --update-db 需要至少一个更新项（--title 或 --db-props）');
+    out('错误: --update-db 需要至少一个更新项（--title / --description / --db-props / --set-icon / --set-cover / --restore）');
     process.exit(1);
   }
 
   out(`\n📊 更新数据库: ${dbId}`);
   if (updates.title) out(`  标题: ${opts.title}`);
-  if (updates.properties) out(`  新属性: ${Object.keys(updates.properties).join(', ')}`);
+  if (updates.description) out(`  描述: ${opts.dbDescription}`);
+  if (updates.icon) out(`  图标: ${opts.setIcon}`);
+  if (updates.cover) out(`  封面: ${opts.setCover}`);
+  if (updates.in_trash === false) out(`  恢复: 从回收站恢复`);
+  if (updates.properties) {
+    const propKeys = Object.keys(updates.properties);
+    const deleteKeys = propKeys.filter(k => updates.properties[k] === null);
+    const addKeys = propKeys.filter(k => updates.properties[k] !== null);
+    if (addKeys.length) out(`  新属性/修改: ${addKeys.join(', ')}`);
+    if (deleteKeys.length) out(`  删除属性: ${deleteKeys.join(', ')}`);
+  }
 
   try {
     const result = await rest.updateDatabase(dbId, updates);

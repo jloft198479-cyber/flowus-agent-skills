@@ -101,7 +101,7 @@ node flowus-write.js --text "总结内容" "总结"
 ## 支持的 FlowUs 块类型
 
 heading_1/2/3, paragraph, bulleted_list_item, numbered_list_item, to_do,
-code, callout, quote, divider, image, bookmark, table(+table_row), toggle, child_page
+code, callout, quote, divider, image, bookmark, embed, table(+table_row), toggle, equation, link_to_page
 
 ## 许可证
 
