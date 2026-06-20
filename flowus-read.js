@@ -2,7 +2,7 @@
 /**
  * FlowUs 通用读取脚本 v1.0
  *
- * 基于 lib/mcp-client + lib/rest-client 共享底层，
+ * 基于 lib/rest-client，
  * 提供完整的 FlowUs 内容读取能力：
  *
  *   - 数据库记录列表 / 属性定义 / 关键词搜索（含正文）
@@ -32,7 +32,6 @@ process.stderr.setDefaultEncoding('utf-8');
 
 const path = require('path');
 const fs = require('fs');
-const mcp = require('./lib/mcp-client');
 const rest = require('./lib/rest-client');
 
 // ============== 配置 ==============
